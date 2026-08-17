@@ -1,0 +1,1 @@
+"""Official research-source adapters."""

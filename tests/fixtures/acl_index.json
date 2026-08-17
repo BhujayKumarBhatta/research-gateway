@@ -1,0 +1,26 @@
+{
+  "source": "official-acl-anthology",
+  "version": "fixture-1",
+  "records": [
+    {
+      "id": "2025.acl-long.1",
+      "title": "Instruction Fine Tuning Failures",
+      "authors": [{"name": "Ada Lovelace"}],
+      "year": 2025,
+      "venue": "ACL",
+      "doi": "10.1000/test",
+      "url": "https://aclanthology.org/2025.acl-long.1/",
+      "abstract": "A study of failure modes.",
+      "keywords": ["fine-tuning", "failure"]
+    },
+    {
+      "id": "2024.findings-acl.2",
+      "title": "Reliable Language Models",
+      "authors": [{"name": "Grace Hopper"}],
+      "year": 2024,
+      "venue": "Findings of ACL",
+      "url": "https://aclanthology.org/2024.findings-acl.2/",
+      "keywords": ["reliability"]
+    }
+  ]
+}

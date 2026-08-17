@@ -1,0 +1,6 @@
+import { api } from "../api";
+import { Feedback, PageHeader, Panel, Status } from "../components";
+import { useLoad } from "../hooks";
+
+type Source={name:string;enabled:boolean;configured:boolean;available:boolean;credential_requirement?:string;read_capabilities?:string[];write_capabilities?:string[];retention_policy?:{raw_metadata:string;abstract_storage:string};unavailable_reason?:string};
+export function SourcesPage(){const state=useLoad(()=>api<{sources:Source[]}>("/status"));return <><PageHeader eyebrow="Connections" title="Source contracts"/><Feedback loading={state.loading} error={state.error}><div className="source-grid">{state.data?.sources.map(s=><Panel key={s.name}><div className="panel-heading"><h2>{s.name.replaceAll("_"," ")}</h2><Status tone={s.available?"good":"neutral"}>{s.available?"Available":"Unavailable"}</Status></div><p>{s.credential_requirement||"No credential required"}</p>{s.unavailable_reason&&<small>{s.unavailable_reason.replaceAll("_"," ")}</small>}<dl><dt>Read</dt><dd>{s.read_capabilities?.join(", ")||"None"}</dd><dt>Write</dt><dd>{s.write_capabilities?.join(", ")||"None"}</dd>{s.retention_policy&&<><dt>Saved metadata</dt><dd>{s.retention_policy.raw_metadata}; abstracts {s.retention_policy.abstract_storage}</dd></>}</dl></Panel>)}</div></Feedback></>}

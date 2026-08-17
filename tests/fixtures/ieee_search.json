@@ -1,0 +1,20 @@
+{
+  "total_records": 3,
+  "total_searched": 7000000,
+  "articles": [
+    {
+      "article_number": "999",
+      "title": "An IEEE Paper",
+      "authors": {"authors": [{"full_name": "Ada Lovelace"}]},
+      "publication_year": "2025",
+      "publication_date": "01 Jan 2025",
+      "publication_title": "IEEE Test Conference",
+      "doi": "10.2000/ieee",
+      "abstract": "Licensed abstract",
+      "citing_paper_count": 4,
+      "content_type": "Conferences",
+      "html_url": "https://ieeexplore.ieee.org/document/999",
+      "index_terms": {"author_terms": {"terms": ["testing"]}}
+    }
+  ]
+}

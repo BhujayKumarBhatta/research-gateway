@@ -1,0 +1,33 @@
+{
+  "search-results": {
+    "opensearch:totalResults": "42",
+    "opensearch:startIndex": "0",
+    "opensearch:itemsPerPage": "2",
+    "entry": [
+      {
+        "dc:identifier": "SCOPUS_ID:123",
+        "eid": "2-s2.0-123",
+        "dc:title": "A Scopus Paper",
+        "dc:creator": "Lovelace, Ada",
+        "author": [
+          {"authid": "1", "authname": "Lovelace A."},
+          {"authid": "2", "given-name": "Grace", "surname": "Hopper"}
+        ],
+        "prism:coverDate": "2025-06-01",
+        "prism:publicationName": "Journal of Tests",
+        "prism:doi": "10.1000/TEST",
+        "citedby-count": "7",
+        "subtype": "ar",
+        "subtypeDescription": "Article",
+        "link": [
+          {"@ref": "self", "@href": "https://api.elsevier.com/abstract/123"},
+          {"@ref": "scopus", "@href": "https://www.scopus.com/record/123"}
+        ]
+      },
+      {
+        "eid": "2-s2.0-124",
+        "dc:title": "Sparse Metadata Paper"
+      }
+    ]
+  }
+}

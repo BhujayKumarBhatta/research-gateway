@@ -1,0 +1,19 @@
+{
+  "metadata": {"total": 2, "page": 1, "limit": 1},
+  "hits": [
+    {
+      "uid": "WOS:000123",
+      "title": "A Web of Science Paper",
+      "names": {"authors": [{"displayName": "Ada Lovelace"}]},
+      "source": {
+        "sourceTitle": "Journal of Tests",
+        "publishYear": 2025,
+        "publishDate": "2025-01-01"
+      },
+      "identifiers": {"doi": "10.3000/wos", "issn": "1234-5678"},
+      "citations": [{"db": "WOS", "count": 8}],
+      "types": ["Article"],
+      "links": {"record": "https://www.webofscience.com/wos/woscc/full-record/WOS:000123"}
+    }
+  ]
+}

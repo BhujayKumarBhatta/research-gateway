@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/"
+      xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <title>ArXiv Query</title>
+  <opensearch:totalResults>12</opensearch:totalResults>
+  <opensearch:startIndex>0</opensearch:startIndex>
+  <opensearch:itemsPerPage>1</opensearch:itemsPerPage>
+  <entry>
+    <id>http://arxiv.org/abs/2501.01234v2</id>
+    <updated>2025-02-02T00:00:00Z</updated>
+    <published>2025-01-01T00:00:00Z</published>
+    <title>  An arXiv Paper\nWith Spacing </title>
+    <summary> Abstract text. </summary>
+    <author><name>Ada Lovelace</name></author>
+    <author><name>Grace Hopper</name></author>
+    <arxiv:doi>10.1000/test</arxiv:doi>
+    <arxiv:journal_ref>Journal of Tests 1 (2025)</arxiv:journal_ref>
+    <arxiv:primary_category term="cs.CL" />
+    <category term="cs.CL" />
+    <category term="cs.AI" />
+    <link href="http://arxiv.org/abs/2501.01234v2" rel="alternate" type="text/html" />
+  </entry>
+</feed>

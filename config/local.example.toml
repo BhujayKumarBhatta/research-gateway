@@ -1,0 +1,58 @@
+# Copy this to ~/.research-gateway/config.toml, never into a tracked repo file.
+[service]
+host = "127.0.0.1"
+port = 8765
+
+[database]
+path = "~/.research-gateway/data/research_gateway.db"
+
+[mcp_remote_auth]
+mode = "static_bearer"
+token = ""
+allow_unauthenticated = false
+
+[tunnel]
+enabled = true
+authtoken = ""
+domain = ""
+expose_ui = false
+start_on_serve = false
+
+[scopus]
+enabled = true
+api_key = ""
+institutional_token = ""
+
+[arxiv]
+enabled = true
+polite_delay_seconds = 3.0
+
+[acl_anthology]
+enabled = true
+index_path = "~/.research-gateway/indexes/acl/index.json"
+
+[ieee_xplore]
+enabled = false
+api_key = ""
+
+[wos]
+enabled = false
+mode = "starter"
+api_key = ""
+
+[acm_dl]
+enabled = false
+
+[zotero]
+enabled = false
+api_key = ""
+library_type = "user"
+library_id = ""
+collection_key = ""
+collection_name = ""
+
+[github]
+enabled = false
+token = ""
+default_owner = ""
+default_repository = ""

@@ -1,0 +1,9 @@
+site_name: Research Gateway
+site_description: Local-first scholarly evidence search, screening, provenance, and export.
+strict: true
+nav:
+  - Home: index.md
+  - Architecture: architecture.md
+  - Operations: operations.md
+  - Providers: providers.md
+  - Safety: safety.md

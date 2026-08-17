@@ -1,0 +1,5 @@
+import { api } from "../api";
+import { Empty, Feedback, PageHeader, Panel, Status } from "../components";
+import { useLoad } from "../hooks";
+type Event={audit_event_id:string;timestamp_utc:string;operation:string;source?:string;status:string;safe_summary?:string;error_type?:string};
+export function AuditPage(){const state=useLoad(()=>api<Event[]>("/audit"));return <><PageHeader eyebrow="Trace" title="Audit history"><button onClick={()=>state.refresh()}>Refresh</button></PageHeader><Panel><Feedback loading={state.loading} error={state.error}>{state.data?.length?<div className="audit-list">{state.data.map(event=><article key={event.audit_event_id}><time>{new Date(event.timestamp_utc).toLocaleString()}</time><div><strong>{event.operation}</strong><p>{event.safe_summary||"No summary"}</p><small>{event.source||"local"}{event.error_type?` · ${event.error_type}`:""}</small></div><Status tone={event.status==="completed"?"good":"bad"}>{event.status}</Status></article>)}</div>:<Empty>No audited actions yet.</Empty>}</Feedback></Panel></>}
