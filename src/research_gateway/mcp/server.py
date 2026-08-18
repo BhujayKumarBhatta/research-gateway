@@ -771,6 +771,17 @@ def create_mcp_server(
         return await runtime.zotero.list_collections(limit=limit)
 
     @server.tool(
+        name="zotero_credential_status",
+        description=(
+            "Read the configured Zotero key's effective library permissions without "
+            "returning the key."
+        ),
+        annotations=REMOTE_READ,
+    )
+    async def zotero_credential_status_tool() -> dict[str, Any]:
+        return await runtime.zotero.credential_status()
+
+    @server.tool(
         name="github_propose_change",
         description=(
             "Dry-run or publish text changes through branch, commit, and pull request only."

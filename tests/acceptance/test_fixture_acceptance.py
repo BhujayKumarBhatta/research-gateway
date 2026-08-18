@@ -122,6 +122,20 @@ async def test_complete_multi_source_fixture_acceptance(tmp_path: Path) -> None:
     arxiv_payload = _arxiv_payload()
     remote_calls: list[tuple[str, str, Any]] = []
     zotero_item_calls = 0
+    zotero_items: dict[str, dict[str, Any]] = {
+        "SEARCH1": {
+            "key": "SEARCH1",
+            "version": 7,
+            "data": {
+                "itemType": "journalArticle",
+                "title": "A Fine-Tuning Search Result",
+                "date": "2025",
+                "url": "https://example.test/fine-tuning",
+                "creators": [{"creatorType": "author", "name": "A. Researcher"}],
+                "collections": [],
+            },
+        }
+    }
 
     async def scopus_handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["X-ELS-APIKey"] == SECRETS[0]
@@ -134,9 +148,22 @@ async def test_complete_multi_source_fixture_acceptance(tmp_path: Path) -> None:
         nonlocal zotero_item_calls
         assert request.headers["Zotero-API-Key"] == SECRETS[1]
         remote_calls.append((request.method, request.url.path, None))
+        if request.method == "GET" and request.url.path == "/keys/current":
+            return httpx.Response(
+                200,
+                json={
+                    "userID": 42,
+                    "access": {"user": {"library": True, "write": True, "notes": True}},
+                },
+            )
         if request.method == "GET" and request.url.path.endswith("/collections"):
             return httpx.Response(200, json=[])
+        if request.method == "GET" and "/items/" in request.url.path:
+            item_key = request.url.path.rsplit("/", 1)[-1]
+            return httpx.Response(200, json=zotero_items[item_key])
         if request.method == "GET" and request.url.path.endswith("/items"):
+            if request.url.params.get("q") == "fine-tuning":
+                return httpx.Response(200, json=[zotero_items["SEARCH1"]])
             return httpx.Response(200, json=[])
         if request.method == "POST" and request.url.path.endswith("/collections"):
             return httpx.Response(200, json={"successful": {"0": {"key": "FINAL"}}})
@@ -145,7 +172,15 @@ async def test_complete_multi_source_fixture_acceptance(tmp_path: Path) -> None:
             items = json.loads(request.content)
             assert len(items) == 1
             assert items[0]["collections"] == ["FINAL"]
-            return httpx.Response(200, json={"successful": {"0": {"key": "ITEM1"}}})
+            zotero_items["ITEM1"] = {
+                "key": "ITEM1",
+                "version": 8,
+                "data": items[0],
+            }
+            return httpx.Response(
+                200,
+                json={"successful": {"0": zotero_items["ITEM1"]}, "failed": {}},
+            )
         raise AssertionError(request.url.path)
 
     async def github_handler(request: httpx.Request) -> httpx.Response:
@@ -243,18 +278,42 @@ async def test_complete_multi_source_fixture_acceptance(tmp_path: Path) -> None:
     try:
         async with Client(create_mcp_server(runtime)) as client:
             listed = await client.list_tools()
-            assert {"gateway_status", "source_list", "research_explore_search"} <= {
-                tool.name for tool in listed.tools
-            }
+            assert {
+                "gateway_status",
+                "source_list",
+                "research_explore_search",
+                "zotero_search",
+                "zotero_get_item",
+                "zotero_credential_status",
+            } <= {tool.name for tool in listed.tools}
             status = await client.call_tool("gateway_status")
             sources_status = await client.call_tool("source_list")
+            zotero_permissions = await client.call_tool("zotero_credential_status")
+            zotero_search = await client.call_tool("zotero_search", {"query": "fine-tuning"})
+            searched_item = zotero_search.structured_content["items"][0]
+            assert searched_item["item_key"] == "SEARCH1"
+            zotero_item = await client.call_tool(
+                "zotero_get_item", {"item_key": searched_item["item_key"]}
+            )
+            assert zotero_item.structured_content["item_key"] == searched_item["item_key"]
+            assert zotero_item.structured_content["title"] == searched_item["title"]
             assert status.structured_content["database_schema"] == 2
+            assert zotero_permissions.structured_content["library_read"] is True
+            assert zotero_permissions.structured_content["library_write"] is True
             assert all(
                 source["available"]
                 for source in sources_status.structured_content["sources"]
                 if source["name"] in {"scopus", "acl_anthology", "arxiv"}
             )
-            safe_outputs.extend([status.structured_content, sources_status.structured_content])
+            safe_outputs.extend(
+                [
+                    status.structured_content,
+                    sources_status.structured_content,
+                    zotero_permissions.structured_content,
+                    zotero_search.structured_content,
+                    zotero_item.structured_content,
+                ]
+            )
 
             await client.call_tool(
                 "study_create",
@@ -402,6 +461,14 @@ async def test_complete_multi_source_fixture_acceptance(tmp_path: Path) -> None:
                 "zotero_sync_corpus", {"study_id": "acceptance-study", "dry_run": False}
             )
             assert zotero_first.structured_content["created"] == 1
+            created_item = zotero_first.structured_content["created_items"][0]
+            assert created_item["evidence_id"] == final_evidence_id
+            assert created_item["item_key"] == "ITEM1"
+            created_readback = await client.call_tool(
+                "zotero_get_item", {"item_key": created_item["item_key"]}
+            )
+            assert created_readback.structured_content["item_key"] == "ITEM1"
+            assert created_readback.structured_content["title"] == created_item["title"]
             assert zotero_second.structured_content["created"] == 0
             assert zotero_second.structured_content["already_linked"] == 1
             assert zotero_item_calls == 1
@@ -461,6 +528,7 @@ async def test_complete_multi_source_fixture_acceptance(tmp_path: Path) -> None:
                     exported_csv.structured_content,
                     zotero_plan.structured_content,
                     zotero_first.structured_content,
+                    created_readback.structured_content,
                     github_file.structured_content,
                     issue.structured_content,
                     github_plan.structured_content,
