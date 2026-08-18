@@ -61,18 +61,55 @@ uv run research-gateway serve
 
 Open `http://127.0.0.1:8765/ui`.
 
+For a WSL installation whose durable data belongs on Windows drive D, copy the
+database safely and update only the non-secret path entries in the global config:
+
+```bash
+uv run research-gateway relocate-storage \
+  --config /mnt/c/Users/Bhujay_ROG/.research-gateway/config.toml \
+  --root /mnt/d/AI/research-gateway
+```
+
+The source database and a timestamped config backup are retained. The destination
+contains `data/research_gateway.db`, rotating logs, Excel backups, and process state.
+
 ## Source behavior
 
 - Scopus uses the official Search API and is the mandatory live release source.
 - arXiv uses the official Atom API and waits between consecutive requests.
 - ACL Anthology searches a local index made from official Anthology data; normal search never scrapes the site.
-- IEEE Xplore and Web of Science Starter have official metadata adapters and are available when configured.
-- Web of Science Expanded remains unavailable without its explicit contract.
+- IEEE Xplore has a complete official Metadata API adapter and deterministic contract tests.
+- Web of Science Starter and Expanded each have complete official API adapters and deterministic contract tests.
+- IEEE and both Web of Science modes remain unavailable for live use until their
+  external approval is active. This does not disable their fixture/contract tests.
 - ACM Digital Library remains honestly unavailable because an official supported search API has not been verified. Crossref or OpenAlex is not presented as ACM search.
-- Zotero creates bibliographic items for final evidence, defaults to dry-run, skips durable existing links, and never deletes or uploads PDFs.
+- Zotero checks the remote library by DOI, then by normalized title and year, before
+  creating anything. It links a matching item back to Evidence, defaults to dry-run,
+  skips durable existing links, and never deletes or uploads PDFs.
 - GitHub supports bounded reads and branch-to-commit-to-pull-request proposals. It defaults to dry-run and never force-pushes, deletes, merges, changes settings, or writes directly to the default branch.
 
 The Sources page and `source_list` MCP tool show actual availability, capabilities, paging notes, and retention policy without displaying credentials.
+
+Each saved paper also receives a conservative publication classification. For
+example, arXiv records are marked as preprints, while an unknown source type stays
+unknown rather than being called peer reviewed without evidence.
+
+## Background service, logs, and Excel safety copy
+
+Use the lifecycle commands for normal day-to-day operation:
+
+```bash
+uv run research-gateway service start
+uv run research-gateway service status
+uv run research-gateway service restart
+uv run research-gateway service stop
+```
+
+Add `--tunnel` to `start` or `restart` to keep the authenticated public MCP endpoint
+running. A timestamped Excel workbook is created on service start and
+`backups/latest.xlsx` always points to the newest completed snapshot. Logs rotate at
+the configured size and configured credentials are removed by the central redaction
+filter.
 
 ## Private remote MCP through ngrok
 
@@ -109,11 +146,12 @@ Run the real local gates after fixture and UI checks are green:
 ```bash
 uv run research-gateway acceptance live-scopus
 uv run research-gateway acceptance live-open
+uv run research-gateway acceptance live-licensed
 uv run research-gateway acceptance remote-ngrok
 uv run research-gateway acceptance live-scopus-ngrok
 ```
 
-Live gates use temporary databases. They do not print configured secrets or alter normal research data. GitHub Actions uses fixtures and mocks only; it requires no external credentials.
+Live gates use temporary databases. They do not print configured secrets or alter normal research data. `live-licensed` runs an approved Web of Science or IEEE gate and otherwise reports `LIVE TEST DEFERRED — EXTERNAL APPROVAL PENDING` separately for Starter, Expanded, and IEEE. GitHub Actions uses fixtures and mocks only; it requires no external credentials.
 
 ## Configuration and limits
 

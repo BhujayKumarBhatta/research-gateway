@@ -6,6 +6,7 @@ from typing import Any
 from research_gateway.db.database import EvidenceDatabase
 from research_gateway.domain.models import SearchMode, SourceRecord
 from research_gateway.security import redact_text
+from research_gateway.services.classification import classify_record
 from research_gateway.sources.base import ProviderError, SourceAdapter
 from research_gateway.sources.registry import SourceRegistry
 
@@ -137,7 +138,7 @@ class ResearchService:
                 if not page.records:
                     break
                 for record in page.records:
-                    retained = _apply_retention(record, adapter)
+                    retained = _apply_retention(classify_record(record), adapter)
                     outcome = await self.database.ingest_search_hit(
                         run.search_run_id, retrieved + 1, retained
                     )

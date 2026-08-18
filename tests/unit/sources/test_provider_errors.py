@@ -49,9 +49,7 @@ async def test_unavailable_and_unconfigured_providers_are_explicit() -> None:
     await ieee.aclose()
 
     wos = WosAdapter(WosSettings(enabled=True, mode="expanded", api_key="key"))
-    assert wos.status.unavailable_reason == "expanded_contract_requires_configured_base_url"
-    with pytest.raises(ProviderUnavailableError):
-        await wos.count("query")
+    assert wos.status.unavailable_reason == "credential_approval_pending"
     await wos.aclose()
 
 

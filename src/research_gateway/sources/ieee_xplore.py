@@ -33,16 +33,23 @@ class IeeeXploreAdapter(SourceAdapter):
 
     @property
     def status(self) -> ProviderStatus:
+        reason = None
+        if not self.settings.configured:
+            reason = "api_key_not_configured"
+        elif self.settings.approval_status == "pending":
+            reason = "credential_approval_pending"
+        elif self.settings.approval_status == "denied":
+            reason = "credential_approval_denied"
         return ProviderStatus(
             name=self.name,
             enabled=self.settings.enabled,
             configured=self.settings.configured,
-            available=self.settings.enabled and self.settings.configured,
+            available=self.settings.enabled and self.settings.configured and self.settings.approved,
             credential_requirement="IEEE Xplore Metadata API key",
             read_capabilities=["count", "search", "explore", "save"],
             retention_policy=self.retention_policy,
             paging_notes="Official Metadata API; start_record is one-based; max page size 200.",
-            unavailable_reason=None if self.settings.configured else "api_key_not_configured",
+            unavailable_reason=reason,
         )
 
     async def _request(self, params: dict[str, Any]) -> dict[str, Any]:
@@ -65,7 +72,9 @@ class IeeeXploreAdapter(SourceAdapter):
         return payload
 
     async def count(self, query: str, *, filters: dict[str, Any] | None = None) -> int:
-        payload = await self._request({"querytext": query, "start_record": 1, "max_records": 1})
+        params = self._search_params(query, filters=filters)
+        params.update({"start_record": 1, "max_records": 1})
+        payload = await self._request(params)
         total = clean_int(payload.get("total_records") or payload.get("totalfound"))
         if total is None:
             raise ProviderPayloadError("IEEE Xplore response is missing the total result count.")
@@ -82,14 +91,8 @@ class IeeeXploreAdapter(SourceAdapter):
     ) -> SourcePage:
         if not 1 <= limit <= self.retention_policy.max_page_size:
             raise ValueError("IEEE Xplore limit must be between 1 and 200.")
-        params: dict[str, Any] = {
-            "querytext": query,
-            "start_record": offset + 1,
-            "max_records": limit,
-        }
-        for key in ("publication_year", "start_year", "end_year", "content_type"):
-            if filters and filters.get(key) is not None:
-                params[key] = filters[key]
+        params = self._search_params(query, filters=filters)
+        params.update({"start_record": offset + 1, "max_records": limit})
         if sort:
             if sort.get("field"):
                 params["sort_field"] = sort["field"]
@@ -111,8 +114,37 @@ class IeeeXploreAdapter(SourceAdapter):
             next_offset=next_offset,
             records=records,
             pagination={"start_record": offset + 1, "max_records": limit},
-            provider_metadata={"retention": "minimal_on_save"},
+            provider_metadata={
+                "retention": "minimal_on_save",
+                "query_field": self.settings.query_field,
+            },
         )
+
+    def _search_params(
+        self, query: str, *, filters: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {self.settings.query_field: query}
+        allowed = {
+            "abstract",
+            "affiliation",
+            "article_number",
+            "article_title",
+            "author",
+            "doi",
+            "end_date",
+            "index_terms",
+            "isbn",
+            "issn",
+            "publication_id",
+            "publication_title",
+            "publication_year",
+            "start_date",
+            "content_type",
+        }
+        for key, value in (filters or {}).items():
+            if key in allowed and value is not None:
+                params[key] = value
+        return params
 
     def _map_article(self, item: dict[str, Any]) -> SourceRecord:
         article_id = str(item.get("article_number") or "unknown")

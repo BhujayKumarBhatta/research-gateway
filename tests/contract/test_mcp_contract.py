@@ -39,7 +39,7 @@ async def test_real_mcp_client_lists_and_calls_tools(tmp_path: Path) -> None:
         assert page.structured_content["studies"][0]["study_id"] == "mcp-study"
 
         status = await client.call_tool("gateway_status")
-        assert status.structured_content["database_schema"] == 1
+        assert status.structured_content["database_schema"] == 2
         sources = await client.call_tool("source_list")
         assert any(source["name"] == "scopus" for source in sources.structured_content["sources"])
         await client.call_tool(

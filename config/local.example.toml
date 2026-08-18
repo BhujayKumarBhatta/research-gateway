@@ -6,6 +6,18 @@ port = 8765
 [database]
 path = "~/.research-gateway/data/research_gateway.db"
 
+[logging]
+# path = "~/.research-gateway/data/logs/research-gateway.log"
+level = "INFO"
+
+[backup]
+enabled = true
+on_service_start = true
+retention_count = 20
+
+[runtime]
+# directory = "~/.research-gateway/data/runtime"
+
 [mcp_remote_auth]
 mode = "static_bearer"
 token = ""
@@ -33,11 +45,14 @@ index_path = "~/.research-gateway/indexes/acl/index.json"
 
 [ieee_xplore]
 enabled = false
+approval_status = "pending"
 api_key = ""
+query_field = "querytext"
 
 [wos]
 enabled = false
 mode = "starter"
+approval_status = "pending"
 api_key = ""
 
 [acm_dl]

@@ -21,6 +21,8 @@ from research_gateway.runtime import GatewayRuntime
 from research_gateway.tunnel import NgrokTunnel
 
 SCOPUS_ACCEPTANCE_QUERY = 'TITLE-ABS-KEY("instruction fine-tuning")'
+WOS_ACCEPTANCE_QUERY = 'TS=("instruction fine-tuning")'
+IEEE_ACCEPTANCE_QUERY = '"instruction fine-tuning"'
 
 
 async def run_live_scopus(settings: Settings) -> None:
@@ -133,6 +135,99 @@ async def run_live_open(settings: Settings) -> None:
                 if acl_result.is_error or acl_result.structured_content["returned_count"] < 1:
                     raise RuntimeError("ACL Anthology index returned no records for a broad query.")
                 print("LIVE OPEN SOURCES ACCEPTANCE: PASS")
+        finally:
+            await runtime.aclose()
+
+
+async def run_live_wos(settings: Settings) -> None:
+    for mode in ("starter", "expanded"):
+        label = f"WEB OF SCIENCE {mode.upper()}"
+        active = (
+            settings.wos.enabled
+            and settings.wos.configured
+            and settings.wos.approved
+            and settings.wos.mode == mode
+        )
+        if not active:
+            print(f"{label} LIVE TEST DEFERRED — EXTERNAL APPROVAL PENDING")
+            continue
+        await _run_live_licensed_provider(
+            settings,
+            provider="wos",
+            tool_name="wos_search",
+            query=WOS_ACCEPTANCE_QUERY,
+            study_id=f"live-wos-{mode}",
+            label=label,
+        )
+
+
+async def run_live_ieee(settings: Settings) -> None:
+    label = "IEEE XPLORE"
+    if not (
+        settings.ieee_xplore.enabled
+        and settings.ieee_xplore.configured
+        and settings.ieee_xplore.approved
+    ):
+        print(f"{label} LIVE TEST DEFERRED — EXTERNAL APPROVAL PENDING")
+        return
+    from research_gateway.operations.logging import configure_logging
+
+    configure_logging(settings)
+    await _run_live_licensed_provider(
+        settings,
+        provider="ieee_xplore",
+        tool_name="ieee_search",
+        query=IEEE_ACCEPTANCE_QUERY,
+        study_id="live-ieee",
+        label=label,
+    )
+
+
+async def _run_live_licensed_provider(
+    settings: Settings,
+    *,
+    provider: str,
+    tool_name: str,
+    query: str,
+    study_id: str,
+    label: str,
+) -> None:
+    with tempfile.TemporaryDirectory(prefix=f"research-gateway-{provider}-") as directory:
+        temporary = settings.model_copy(deep=True)
+        temporary.database.path = Path(directory) / "acceptance.db"
+        runtime = GatewayRuntime.build(temporary)
+        await runtime.start()
+        safe_results: list[object] = []
+        try:
+            async with Client(create_mcp_server(runtime)) as client:
+                sample = await client.call_tool(tool_name, {"provider_query": query, "limit": 1})
+                if sample.is_error or sample.structured_content["returned_count"] < 1:
+                    raise RuntimeError(f"{label} returned no acceptance metadata.")
+                await client.call_tool(
+                    "study_create",
+                    {"study_id": study_id, "name": f"{label} acceptance", "system_test": True},
+                )
+                saved = await client.call_tool(
+                    "research_save_search",
+                    {
+                        "study_id": study_id,
+                        "provider": provider,
+                        "search_intent": f"Validate {label} official API capture",
+                        "provider_query": query,
+                        "max_records": 1,
+                    },
+                )
+                run = await client.call_tool(
+                    "search_run_get",
+                    {"search_run_id": saved.structured_content["search_run_id"]},
+                )
+                if saved.is_error or not run.structured_content["hits"]:
+                    raise RuntimeError(f"{label} live result was not saved and retrieved.")
+                safe_results.extend(
+                    [sample.structured_content, saved.structured_content, run.structured_content]
+                )
+                _assert_secret_absent(temporary, safe_results, temporary.database.path)
+                print(f"{label} LIVE TEST PASS")
         finally:
             await runtime.aclose()
 
