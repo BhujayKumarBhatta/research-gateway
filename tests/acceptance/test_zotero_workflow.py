@@ -12,7 +12,7 @@ from mcp.client import Client
 from research_gateway.config import ZoteroSettings
 from research_gateway.db.database import EvidenceDatabase
 from research_gateway.domain.models import SourceRecord
-from research_gateway.integrations.zotero import ZoteroAdapter
+from research_gateway.integrations.zotero import ZoteroAdapter, ZoteroSafetyError
 from research_gateway.mcp.server import create_mcp_server
 
 
@@ -388,5 +388,95 @@ async def test_disposable_zotero_research_and_bibliography_workflow(tmp_path: Pa
     assert any(
         event["operation"] == "zotero.delete_collection" and event["status"] == "failed"
         for event in events
+    )
+    await http_client.aclose()
+
+
+@pytest.mark.acceptance
+@pytest.mark.asyncio
+async def test_zotero_explicit_safety_and_metadata_paths(tmp_path: Path) -> None:
+    database = EvidenceDatabase(tmp_path / "zotero-safety.db")
+    await database.migrate()
+    fixture = ZoteroFixture()
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(fixture))
+    adapter = ZoteroAdapter(
+        ZoteroSettings(enabled=True, api_key="fixture-zotero-key", library_id="42"),
+        database,
+        client=http_client,
+    )
+
+    planned = await adapter.create_item(
+        title="Metadata-only approved paper",
+        authors=[{"firstName": "Ada", "lastName": "Lovelace"}],
+        year="2026",
+        doi="10.5555/metadata-only",
+        item_type="journalArticle",
+        tags=["peer-reviewed"],
+    )
+    assert planned["would_create"] is True
+    assert planned["planned_item"]["creators"][0]["lastName"] == "Lovelace"
+    assert fixture.item_post_count == 0
+
+    top = await adapter.create_collection("Recursive-Test")
+    top_key = top["collection_key"]
+    sub = await adapter.create_collection("Child", parent_collection_key=top_key)
+    sub_key = sub["collection_key"]
+    created = await adapter.create_item(
+        title="Metadata-only approved paper",
+        authors=[{"firstName": "Ada", "lastName": "Lovelace"}],
+        year="2026",
+        doi="10.5555/metadata-only",
+        item_type="journalArticle",
+        collection_keys=[top_key],
+        tags=["peer-reviewed", "keep-unless-replaced"],
+        dry_run=False,
+    )
+    item_key = created["item_key"]
+    replaced = await adapter.set_tags(
+        item_key, ["preprint-non-reputed", "R1"], preserve_existing=False
+    )
+    assert replaced["tags"] == ["preprint-non-reputed", "R1"]
+    assert (await adapter.get_link_for_item(item_key))["link"] is None
+
+    deleted_tree = await adapter.delete_collection(top_key, dry_run=False, recursive=True)
+    assert deleted_tree["deleted_collection_keys"] == [sub_key, top_key]
+    assert deleted_tree["preserved_item_keys"] == [item_key]
+    assert item_key in fixture.items
+    assert fixture.collections == {}
+    assert (await adapter.delete_item(item_key, dry_run=False))["deleted"] is True
+
+    await database.create_study("unapproved", "Unapproved", "Safety refusal")
+    run = await database.create_search_run(
+        study_id="unapproved",
+        topic_id=None,
+        provider="fixture",
+        mode="save",
+        label="",
+        search_intent="Do not send unapproved evidence to Zotero",
+        provider_query="unapproved",
+        filters={},
+        sort={},
+        requested_limit=1,
+    )
+    evidence = await database.ingest_search_hit(
+        run.search_run_id,
+        1,
+        SourceRecord(
+            provider="fixture",
+            provider_record_id="unapproved-1",
+            title="Unapproved discovery",
+            authors=[{"name": "Careful Researcher"}],
+            year=2026,
+        ),
+    )
+    with pytest.raises(ZoteroSafetyError):
+        await adapter.create_item(evidence_id=evidence.evidence_id, dry_run=False)
+    assert (await adapter.get_link_for_evidence(evidence.evidence_id))["link"] is None
+    audit = await database.list_audit_events(limit=100)
+    assert any(
+        event["operation"] == "zotero.create_item"
+        and event["status"] == "failed"
+        and event["error_type"] == "zotero_safety_error"
+        for event in audit
     )
     await http_client.aclose()
