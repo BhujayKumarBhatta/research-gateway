@@ -42,9 +42,8 @@ class NgrokTunnel:
         self.backend = backend
         self.listener: Any | None = None
         self.public_url: str | None = None
-        self.state_path = state_path or (
-            Path.home() / ".research-gateway" / "runtime" / "tunnel.json"
-        )
+        runtime_directory = settings.runtime.directory or settings.database.path.parent / "runtime"
+        self.state_path = state_path or runtime_directory / "tunnel.json"
 
     def start(self) -> TunnelStatus:
         if self.listener is not None:

@@ -1,6 +1,12 @@
 import { expect, test } from "@playwright/test";
 
 test("reviewer can move from overview to evidence filters", async ({ page }) => {
+  await page.route("**/api/v1/studies", route => route.fulfill({
+    json: [{study_id: "s1", name: "Study one"}],
+  }));
+  await page.route("**/api/v1/studies/s1/topics", route => route.fulfill({
+    json: [{topic_id: "t1", name: "Topic one"}],
+  }));
   await page.route("**/api/v1/status", route => route.fulfill({
     json: {
       summary: {total: 3, unreviewed: 2, included: 0, excluded: 0, final_count: 1, search_runs: 4},
@@ -13,7 +19,9 @@ test("reviewer can move from overview to evidence filters", async ({ page }) => 
         evidence_id: "e1", evidence_code: "E000001", title: "Traceable research result",
         authors: [{name: "Ada Example"}], author_names: "Ada Example", year: 2025,
         publication: "Journal of Evidence", document_type: "article",
+        publication_type: "journal_article", review_status: "peer_reviewed",
         normalized_doi: "10.1000/example", screening_status: "unreviewed", final_corpus: false,
+        publication_type: "journal_article", review_status: "peer_reviewed",
         identifiers: [{identifier_type:"doi", identifier_value:"10.1000/example", source_provider:"scopus"}],
         discoveries: [{search_run_id:"r1", search_code:"Q0001", provider:"scopus", rank:1, discovered_at:"2026-01-01"}],
         screening_history: [], notes: [],
@@ -35,12 +43,34 @@ test("reviewer can move from overview to evidence filters", async ({ page }) => 
   await expect(page.getByRole("heading", {name: "Evidence corpus"})).toBeVisible();
   await expect(page.getByText("Traceable research result")).toBeVisible();
   await expect(page.getByLabel("Search evidence")).toBeVisible();
+  await page.getByLabel("Study").selectOption("s1");
+  await page.getByLabel("Topic").selectOption("t1");
+  await page.getByLabel("Source").selectOption("scopus");
+  await page.getByLabel("Search ID").fill("Q0001");
+  await page.getByLabel("Discovery from").fill("2026-01-01");
+  await page.getByLabel("Discovery to").fill("2026-12-31");
+  await page.getByLabel("Screening status").selectOption("unreviewed");
+  const filtered = page.waitForRequest(request => {
+    const url = new URL(request.url());
+    return url.pathname.endsWith("/evidence")
+      && url.searchParams.get("study_id") === "s1"
+      && url.searchParams.get("topic_id") === "t1"
+      && url.searchParams.get("provider") === "scopus"
+      && url.searchParams.get("search_code") === "Q0001"
+      && url.searchParams.get("discovered_from") === "2026-01-01"
+      && url.searchParams.get("discovered_to") === "2026-12-31"
+      && url.searchParams.get("status") === "unreviewed"
+      && url.searchParams.get("final") === "false";
+  });
+  await page.getByLabel("Final corpus").selectOption("false");
+  await filtered;
   await page.getByRole("link", {name: "Traceable research result"}).click();
   await expect(page.getByRole("heading", {name: "Traceable research result"})).toBeVisible();
   await expect(page.getByText("10.1000/example").first()).toBeVisible();
 });
 
 test("reviewer can inspect an exact search run and its discoveries", async ({page}) => {
+  await page.route("**/api/v1/studies", route => route.fulfill({json: []}));
   await page.route("**/api/v1/search-runs**", route => {
     if (new URL(route.request().url()).pathname.endsWith("/search-runs/r1")) {
       return route.fulfill({json: {

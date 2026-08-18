@@ -1,0 +1,41 @@
+{
+  "QueryResult": {"QueryID": 42, "RecordsSearched": 100, "RecordsFound": 12},
+  "Data": {
+    "Records": {
+      "records": {
+        "REC": [
+          {
+            "UID": "WOS:000456",
+            "static_data": {
+              "summary": {
+                "titles": {
+                  "title": [
+                    {"type": "item", "content": "Expanded contract paper"},
+                    {"type": "source", "content": "Journal of Contract Tests"}
+                  ]
+                },
+                "names": {"name": [{"role": "author", "display_name": "Ada Lovelace"}]},
+                "pub_info": {"pubyear": "2025", "sortdate": "2025-02-01"},
+                "doctypes": {"doctype": ["Article"]}
+              },
+              "fullrecord_metadata": {
+                "normalized_doctypes": {"doctype": ["Article"]},
+                "keywords": {"keyword": ["fine tuning", "testing"]}
+              }
+            },
+            "dynamic_data": {
+              "cluster_related": {
+                "identifiers": {
+                  "identifier": [{"type": "doi", "value": "10.3000/expanded"}]
+                }
+              },
+              "citation_related": {
+                "tc_list": {"silo_tc": [{"coll_id": "WOS", "local_count": 17}]}
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

@@ -48,11 +48,14 @@ async def _database_with_final_evidence(tmp_path: Path) -> tuple[EvidenceDatabas
 @pytest.mark.asyncio
 async def test_zotero_dry_run_does_not_call_remote(tmp_path: Path) -> None:
     database, _ = await _database_with_final_evidence(tmp_path)
+    requests: list[str] = []
 
-    async def unexpected(_: httpx.Request) -> httpx.Response:
-        raise AssertionError("dry-run made a remote request")
+    async def read_only(request: httpx.Request) -> httpx.Response:
+        requests.append(request.method)
+        assert request.method == "GET"
+        return httpx.Response(200, json=[])
 
-    client = httpx.AsyncClient(transport=httpx.MockTransport(unexpected))
+    client = httpx.AsyncClient(transport=httpx.MockTransport(read_only))
     adapter = ZoteroAdapter(
         ZoteroSettings(enabled=True, api_key="zotero-secret", library_id="42"),
         database,
@@ -63,11 +66,13 @@ async def test_zotero_dry_run_does_not_call_remote(tmp_path: Path) -> None:
         "dry_run": True,
         "final_evidence_count": 1,
         "would_create": 1,
+        "would_link_existing": 0,
         "already_linked": 0,
         "would_ensure_collection": False,
         "deleted": 0,
         "files_uploaded": 0,
     }
+    assert requests == ["GET"]
     await client.aclose()
 
 
@@ -80,6 +85,8 @@ async def test_zotero_write_is_idempotent_from_durable_link(tmp_path: Path) -> N
         nonlocal calls
         calls += 1
         assert request.headers["Zotero-API-Key"] == "zotero-secret"
+        if request.method == "GET":
+            return httpx.Response(200, json=[])
         return httpx.Response(200, json={"successful": {"0": {"key": "ITEM1"}}})
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -93,8 +100,48 @@ async def test_zotero_write_is_idempotent_from_durable_link(tmp_path: Path) -> N
     assert first["created"] == 1
     assert second["created"] == 0
     assert second["already_linked"] == 1
-    assert calls == 1
+    assert calls == 2
     assert await database.get_zotero_link(evidence_id, "user", "42")
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_zotero_links_remote_doi_match_instead_of_creating_duplicate(tmp_path: Path) -> None:
+    database, evidence_id = await _database_with_final_evidence(tmp_path)
+    requests: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.method)
+        assert request.method == "GET"
+        assert request.url.params["q"] == "10.1000/final"
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "key": "REMOTE1",
+                    "version": 4,
+                    "data": {
+                        "itemType": "journalArticle",
+                        "title": "A useful final paper",
+                        "DOI": "https://doi.org/10.1000/FINAL",
+                        "collections": [],
+                    },
+                }
+            ],
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = ZoteroAdapter(
+        ZoteroSettings(enabled=True, api_key="zotero-secret", library_id="42"),
+        database,
+        client=client,
+    )
+    result = await adapter.sync_final_corpus(study_id="s1", dry_run=False)
+    assert result["created"] == 0
+    assert result["matched_existing"] == 1
+    assert requests == ["GET"]
+    link = await database.get_zotero_link(evidence_id, "user", "42")
+    assert link and link["item_key"] == "REMOTE1"
     await client.aclose()
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import aiosqlite
 import pytest
 
 from research_gateway.db.database import EvidenceDatabase
@@ -17,7 +18,7 @@ async def database(tmp_path: Path) -> EvidenceDatabase:
 
 @pytest.mark.asyncio
 async def test_migrations_create_versioned_schema(database: EvidenceDatabase) -> None:
-    assert await database.user_version() >= 1
+    assert await database.user_version() >= 2
     tables = await database.table_names()
     assert {
         "studies",
@@ -29,6 +30,39 @@ async def test_migrations_create_versioned_schema(database: EvidenceDatabase) ->
         "screening_events",
         "audit_events",
     }.issubset(tables)
+
+
+@pytest.mark.asyncio
+async def test_v1_database_migrates_classification_columns_without_data_loss(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "v1.db"
+    async with aiosqlite.connect(path) as connection:
+        await connection.execute(
+            "CREATE TABLE evidence ("
+            "evidence_id TEXT PRIMARY KEY, evidence_code TEXT NOT NULL, normalized_doi TEXT, "
+            "bibliographic_fingerprint TEXT, screening_status TEXT NOT NULL DEFAULT 'unreviewed', "
+            "final_corpus INTEGER NOT NULL DEFAULT 0)"
+        )
+        await connection.execute(
+            "INSERT INTO evidence(evidence_id,evidence_code) VALUES('old-id', 'E000001')"
+        )
+        await connection.execute("PRAGMA user_version = 1")
+        await connection.commit()
+
+    migrated = EvidenceDatabase(path)
+    await migrated.migrate()
+
+    async with aiosqlite.connect(path) as connection:
+        cursor = await connection.execute("PRAGMA table_info(evidence)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        row = await (
+            await connection.execute(
+                "SELECT evidence_id,publication_type,review_status FROM evidence"
+            )
+        ).fetchone()
+    assert {"publication_type", "review_status"}.issubset(columns)
+    assert row == ("old-id", None, "unknown")
 
 
 @pytest.mark.asyncio

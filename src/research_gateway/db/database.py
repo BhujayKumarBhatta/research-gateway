@@ -20,7 +20,7 @@ from research_gateway.domain.models import (
     SourceRecord,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _SAFE_TABLES = {
     "studies",
     "topics",
@@ -145,6 +145,8 @@ class EvidenceDatabase:
                     normalized_doi TEXT,
                     url TEXT,
                     document_type TEXT,
+                    publication_type TEXT,
+                    review_status TEXT NOT NULL DEFAULT 'unknown',
                     keywords_json TEXT NOT NULL DEFAULT '[]',
                     citation_count INTEGER,
                     citation_source TEXT,
@@ -256,6 +258,18 @@ class EvidenceDatabase:
                 );
                 """
             )
+            columns = {
+                str(row[1])
+                for row in await (
+                    await connection.execute("PRAGMA table_info(evidence)")
+                ).fetchall()
+            }
+            if "publication_type" not in columns:
+                await connection.execute("ALTER TABLE evidence ADD COLUMN publication_type TEXT")
+            if "review_status" not in columns:
+                await connection.execute(
+                    "ALTER TABLE evidence ADD COLUMN review_status TEXT NOT NULL DEFAULT 'unknown'"
+                )
             await connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             await connection.commit()
         finally:
@@ -666,9 +680,10 @@ class EvidenceDatabase:
                     INSERT INTO evidence(
                         evidence_id,evidence_code,title,normalized_title,authors_json,author_names,
                         abstract,year,publication_date,publication,doi,normalized_doi,url,
-                        document_type,keywords_json,citation_count,citation_source,
+                        document_type,publication_type,review_status,keywords_json,
+                        citation_count,citation_source,
                         citation_timestamp,open_access_json,bibliographic_fingerprint,created_at,updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         evidence_id,
@@ -685,6 +700,8 @@ class EvidenceDatabase:
                         doi,
                         record.url,
                         record.document_type,
+                        record.publication_type,
+                        record.review_status,
                         json.dumps(record.keywords, ensure_ascii=False),
                         record.citation_count,
                         record.provider if record.citation_count is not None else None,
@@ -1055,6 +1072,8 @@ class EvidenceDatabase:
         query: str | None = None,
         year: int | None = None,
         document_type: str | None = None,
+        publication_type: str | None = None,
+        review_status: str | None = None,
         discovered_from: str | None = None,
         discovered_to: str | None = None,
         offset: int = 0,
@@ -1092,6 +1111,12 @@ class EvidenceDatabase:
         if document_type:
             conditions.append("e.document_type=?")
             parameters.append(document_type)
+        if publication_type:
+            conditions.append("e.publication_type=?")
+            parameters.append(publication_type)
+        if review_status:
+            conditions.append("e.review_status=?")
+            parameters.append(review_status)
         if discovered_from:
             conditions.append("h.discovered_at>=?")
             parameters.append(discovered_from)

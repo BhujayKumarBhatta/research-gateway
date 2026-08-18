@@ -136,6 +136,8 @@ async def test_complete_multi_source_fixture_acceptance(tmp_path: Path) -> None:
         remote_calls.append((request.method, request.url.path, None))
         if request.method == "GET" and request.url.path.endswith("/collections"):
             return httpx.Response(200, json=[])
+        if request.method == "GET" and request.url.path.endswith("/items"):
+            return httpx.Response(200, json=[])
         if request.method == "POST" and request.url.path.endswith("/collections"):
             return httpx.Response(200, json={"successful": {"0": {"key": "FINAL"}}})
         if request.method == "POST" and request.url.path.endswith("/items"):
@@ -246,7 +248,7 @@ async def test_complete_multi_source_fixture_acceptance(tmp_path: Path) -> None:
             }
             status = await client.call_tool("gateway_status")
             sources_status = await client.call_tool("source_list")
-            assert status.structured_content["database_schema"] == 1
+            assert status.structured_content["database_schema"] == 2
             assert all(
                 source["available"]
                 for source in sources_status.structured_content["sources"]
@@ -333,6 +335,8 @@ async def test_complete_multi_source_fixture_acceptance(tmp_path: Path) -> None:
             )
             items = evidence.structured_content["items"]
             assert len(items) == 6
+            assert any(item["review_status"] == "preprint" for item in items)
+            assert any(item["publication_type"] == "journal_article" for item in items)
             decisions = (
                 (items[0]["evidence_id"], "excluded", "Outside the review scope"),
                 (items[1]["evidence_id"], "included", None),
@@ -389,7 +393,8 @@ async def test_complete_multi_source_fixture_acceptance(tmp_path: Path) -> None:
                 "zotero_sync_corpus", {"study_id": "acceptance-study"}
             )
             assert zotero_plan.structured_content["would_create"] == 1
-            assert len(remote_calls) == calls_before_dry_run
+            assert len(remote_calls) > calls_before_dry_run
+            assert all(method == "GET" for method, _, _ in remote_calls[calls_before_dry_run:])
             zotero_first = await client.call_tool(
                 "zotero_sync_corpus", {"study_id": "acceptance-study", "dry_run": False}
             )

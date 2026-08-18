@@ -19,6 +19,22 @@ uv run research-gateway doctor
 uv run research-gateway db-info
 ```
 
+## Put durable data on drive D from WSL
+
+The following command uses the SQLite backup mechanism, keeps the old database, and
+preserves every credential line in the external config. It also configures the log,
+Excel backup, and process-state directories under the same root.
+
+```bash
+uv run research-gateway relocate-storage \
+  --config /mnt/c/Users/Bhujay_ROG/.research-gateway/config.toml \
+  --root /mnt/d/AI/research-gateway
+```
+
+The database then lives at
+`D:\AI\research-gateway\data\research_gateway.db` in Windows and
+`/mnt/d/AI/research-gateway/data/research_gateway.db` in WSL.
+
 Start the local workspace:
 
 ```bash
@@ -26,6 +42,32 @@ uv run research-gateway serve
 ```
 
 Open `http://127.0.0.1:8765/ui`. The service also exposes local MCP at `http://127.0.0.1:8765/mcp`.
+
+For a background service, use:
+
+```bash
+uv run research-gateway service start
+uv run research-gateway service status
+uv run research-gateway service restart
+uv run research-gateway service stop
+```
+
+Use `service start --tunnel` or `service restart --tunnel` for authenticated public
+MCP. The status command prints only safe locations and URLs. It never prints the
+bearer token or provider keys.
+
+## Logs and Excel backups
+
+The service creates an Excel safety copy on every start when `[backup]` has
+`on_service_start = true`. Each file has a UTC timestamp and `latest.xlsx` is refreshed
+only after the workbook is complete. Create one manually with:
+
+```bash
+uv run research-gateway backup-excel
+```
+
+The application log rotates rather than growing forever. The central log filter
+replaces configured secrets before a message is written.
 
 ## Explore and Save
 
@@ -52,8 +94,9 @@ Stopping the Python process closes the listener. ChatGPT connection is a separat
 uv run research-gateway acceptance fixture
 uv run research-gateway acceptance live-scopus
 uv run research-gateway acceptance live-open
+uv run research-gateway acceptance live-licensed
 uv run research-gateway acceptance remote-ngrok
 uv run research-gateway acceptance live-scopus-ngrok
 ```
 
-Fixture acceptance requires no real credential. The live gates use a temporary database and do not pollute normal research data.
+Fixture acceptance requires no real credential. The live gates use a temporary database and do not pollute normal research data. `live-licensed` reports separate results for Web of Science Starter, Web of Science Expanded, and IEEE Xplore. Pending external approval is reported as a deferred live test; fixture and contract coverage still has to pass.

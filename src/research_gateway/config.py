@@ -29,6 +29,39 @@ class DatabaseSettings(BaseModel):
         return value.expanduser().absolute()
 
 
+class LoggingSettings(BaseModel):
+    path: Path | None = None
+    level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    max_bytes: int = Field(default=5_000_000, ge=100_000)
+    backup_count: int = Field(default=5, ge=1, le=50)
+
+    @field_validator("path")
+    @classmethod
+    def expand_optional_path(cls, value: Path | None) -> Path | None:
+        return value.expanduser().absolute() if value else None
+
+
+class BackupSettings(BaseModel):
+    directory: Path | None = None
+    enabled: bool = True
+    on_service_start: bool = True
+    retention_count: int = Field(default=20, ge=1, le=500)
+
+    @field_validator("directory")
+    @classmethod
+    def expand_optional_directory(cls, value: Path | None) -> Path | None:
+        return value.expanduser().absolute() if value else None
+
+
+class RuntimeSettings(BaseModel):
+    directory: Path | None = None
+
+    @field_validator("directory")
+    @classmethod
+    def expand_optional_directory(cls, value: Path | None) -> Path | None:
+        return value.expanduser().absolute() if value else None
+
+
 class TunnelSettings(BaseModel):
     enabled: bool = True
     provider: Literal["ngrok"] = "ngrok"
@@ -66,6 +99,7 @@ class ScopusSettings(BaseModel):
 class WosSettings(BaseModel):
     enabled: bool = False
     mode: Literal["starter", "expanded"] = "starter"
+    approval_status: Literal["pending", "active", "denied"] = "pending"
     api_key: SecretStr = SecretStr("")
     base_url: str = ""
 
@@ -73,15 +107,25 @@ class WosSettings(BaseModel):
     def configured(self) -> bool:
         return bool(self.api_key.get_secret_value())
 
+    @property
+    def approved(self) -> bool:
+        return self.approval_status == "active"
+
 
 class IeeeSettings(BaseModel):
     enabled: bool = False
+    approval_status: Literal["pending", "active", "denied"] = "pending"
     api_key: SecretStr = SecretStr("")
     base_url: str = "https://ieeexploreapi.ieee.org"
+    query_field: Literal["querytext", "meta_data"] = "querytext"
 
     @property
     def configured(self) -> bool:
         return bool(self.api_key.get_secret_value())
+
+    @property
+    def approved(self) -> bool:
+        return self.approval_status == "active"
 
 
 class AclSettings(BaseModel):
@@ -140,6 +184,9 @@ class RetentionSettings(BaseModel):
 class Settings(BaseModel):
     service: ServiceSettings = Field(default_factory=ServiceSettings)
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
+    logging: LoggingSettings = Field(default_factory=LoggingSettings)
+    backup: BackupSettings = Field(default_factory=BackupSettings)
+    runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
     tunnel: TunnelSettings = Field(default_factory=TunnelSettings)
     mcp_remote_auth: McpRemoteAuthSettings = Field(default_factory=McpRemoteAuthSettings)
     scopus: ScopusSettings = Field(default_factory=ScopusSettings)

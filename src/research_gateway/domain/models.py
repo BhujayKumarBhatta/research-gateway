@@ -36,6 +36,8 @@ class SourceRecord(BaseModel):
     doi: str | None = None
     url: str | None = None
     document_type: str | None = None
+    publication_type: str | None = None
+    review_status: Literal["peer_reviewed", "preprint", "not_peer_reviewed", "unknown"] = "unknown"
     keywords: list[str] = Field(default_factory=list)
     citation_count: int | None = None
     open_access: dict[str, Any] | None = None

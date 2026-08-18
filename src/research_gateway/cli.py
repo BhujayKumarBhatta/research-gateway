@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import subprocess
 import sys
 from contextlib import suppress
@@ -18,7 +19,12 @@ from research_gateway.config import (
     load_settings,
     resolve_config_path,
 )
+from research_gateway.db.database import EvidenceDatabase
 from research_gateway.mcp.server import create_mcp_server
+from research_gateway.operations.backups import ExcelBackupService
+from research_gateway.operations.logging import configure_logging
+from research_gateway.operations.service import ServiceManager
+from research_gateway.operations.storage import relocate_storage
 from research_gateway.runtime import GatewayRuntime
 from research_gateway.tunnel import NgrokTunnel
 
@@ -28,7 +34,9 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 acceptance_app = typer.Typer(help="Run deterministic and live release gates.")
+service_app = typer.Typer(help="Start, stop, restart, and inspect the detached local service.")
 app.add_typer(acceptance_app, name="acceptance")
+app.add_typer(service_app, name="service")
 
 
 @app.command("init-config")
@@ -152,9 +160,13 @@ def ui_build() -> None:
 
 
 @app.command("tunnel-status")
-def tunnel_status() -> None:
+def tunnel_status(
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
     """Show non-secret state recorded by the currently running tunnel process."""
-    state_path = Path.home() / ".research-gateway" / "runtime" / "tunnel.json"
+    settings = _load(config)
+    runtime_directory = settings.runtime.directory or settings.database.path.parent / "runtime"
+    state_path = runtime_directory / "tunnel.json"
     if not state_path.is_file():
         typer.echo("Tunnel: stopped")
         return
@@ -167,6 +179,86 @@ def tunnel_status() -> None:
     typer.echo(f"Public URL: {payload.get('public_url')}")
     typer.echo(f"Started: {payload.get('started_at')}")
     typer.echo(f"Exposed paths: {', '.join(payload.get('exposed_paths') or [])}")
+
+
+@app.command("backup-excel")
+def backup_excel(
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    """Create a timestamped Excel snapshot and refresh backups/latest.xlsx."""
+    settings = _load(config)
+
+    async def create() -> None:
+        database = EvidenceDatabase(settings.database.path)
+        await database.migrate()
+        directory = settings.backup.directory or settings.database.path.parent / "backups"
+        result = await ExcelBackupService(
+            database, directory, retention_count=settings.backup.retention_count
+        ).create()
+        typer.echo(f"Excel backup: {result.path}")
+        typer.echo(f"Latest Excel backup: {result.latest_path}")
+
+    asyncio.run(create())
+
+
+@app.command("relocate-storage")
+def relocate_storage_command(
+    root: Annotated[
+        Path,
+        typer.Option("--root", help="New root for DB, logs, backups, and runtime state."),
+    ],
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    """Copy the Evidence Store and repoint non-secret paths without removing the source."""
+    selected = (config or resolve_config_path()).expanduser().absolute()
+    result = relocate_storage(selected, root)
+    asyncio.run(EvidenceDatabase(result.database_path).migrate())
+    typer.echo(f"Database: {result.database_path}")
+    typer.echo(f"Log: {result.log_path}")
+    typer.echo(f"Excel backups: {result.backup_directory}")
+    typer.echo(f"Runtime state: {result.runtime_directory}")
+    typer.echo(f"Previous config backup: {result.config_backup}")
+
+
+@service_app.command("start")
+def service_start(
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+    tunnel: Annotated[bool, typer.Option("--tunnel/--no-tunnel")] = False,
+) -> None:
+    """Start Research Gateway in the background and wait for local health."""
+    selected = (config or resolve_config_path()).expanduser().absolute()
+    result = ServiceManager(_load(selected), selected).start(tunnel=tunnel)
+    _print_service_status(result)
+
+
+@service_app.command("stop")
+def service_stop(
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    """Stop the validated Research Gateway process and its owned tunnel."""
+    selected = (config or resolve_config_path()).expanduser().absolute()
+    result = ServiceManager(_load(selected), selected).stop()
+    typer.echo("Service: stopped" if result.get("stopped") else "Service: already stopped")
+
+
+@service_app.command("restart")
+def service_restart(
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+    tunnel: Annotated[bool, typer.Option("--tunnel/--no-tunnel")] = False,
+) -> None:
+    """Stop and start the background service with the selected tunnel mode."""
+    selected = (config or resolve_config_path()).expanduser().absolute()
+    result = ServiceManager(_load(selected), selected).restart(tunnel=tunnel)
+    _print_service_status(result)
+
+
+@service_app.command("status")
+def service_status(
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    """Show safe process, local URL, public URL, database, and log state."""
+    selected = (config or resolve_config_path()).expanduser().absolute()
+    _print_service_status(ServiceManager(_load(selected), selected).status())
 
 
 @app.command("acl-refresh")
@@ -190,6 +282,19 @@ def serve(
 ) -> None:
     """Serve the local API, browser UI, and Streamable HTTP MCP endpoint."""
     settings = _load(config)
+    log_path = configure_logging(settings)
+    logging.getLogger(__name__).info("Preparing Research Gateway service.")
+    if settings.backup.enabled and settings.backup.on_service_start:
+
+        async def prepare_backup() -> None:
+            database = EvidenceDatabase(settings.database.path)
+            await database.migrate()
+            directory = settings.backup.directory or settings.database.path.parent / "backups"
+            await ExcelBackupService(
+                database, directory, retention_count=settings.backup.retention_count
+            ).create()
+
+        asyncio.run(prepare_backup())
     should_tunnel = settings.tunnel.start_on_serve if tunnel is None else tunnel
     gateway = GatewayRuntime.build(settings)
     http_app = create_app(settings, gateway)
@@ -200,10 +305,12 @@ def serve(
             typer.echo(f"Public health: {public.public_health_url}")
             typer.echo(f"Public MCP: {public.public_mcp_url}")
         typer.echo(f"Local UI: http://{settings.service.host}:{settings.service.port}/ui")
+        typer.echo(f"Log: {log_path}")
         uvicorn.run(http_app, host=settings.service.host, port=settings.service.port)
     finally:
         if active_tunnel:
             active_tunnel.stop()
+        logging.getLogger(__name__).info("Research Gateway service stopped.")
 
 
 @app.command("stdio")
@@ -275,12 +382,59 @@ def acceptance_live_scopus_ngrok(
     asyncio.run(run_remote_ngrok(_load(config), include_scopus=True))
 
 
+@acceptance_app.command("live-wos")
+def acceptance_live_wos(
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    """Run WoS live acceptance only when the configured subscription is active."""
+    from research_gateway.acceptance import run_live_wos
+
+    asyncio.run(run_live_wos(_load(config)))
+
+
+@acceptance_app.command("live-ieee")
+def acceptance_live_ieee(
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    """Run IEEE live acceptance only when its external API approval is active."""
+    from research_gateway.acceptance import run_live_ieee
+
+    asyncio.run(run_live_ieee(_load(config)))
+
+
+@acceptance_app.command("live-licensed")
+def acceptance_live_licensed(
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    """Run or explicitly defer WoS and IEEE live gates according to approval state."""
+    from research_gateway.acceptance import run_live_ieee, run_live_wos
+
+    settings = _load(config)
+    asyncio.run(run_live_wos(settings))
+    asyncio.run(run_live_ieee(settings))
+
+
 def _load(config: Path | None):
     try:
         return load_settings(config)
     except ConfigError as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(2) from exc
+
+
+def _print_service_status(result: dict[str, object]) -> None:
+    typer.echo(f"Service: {'running' if result.get('running') else 'stopped'}")
+    if result.get("pid"):
+        typer.echo(f"PID: {result['pid']}")
+    for label, key in (
+        ("Local UI", "local_ui_url"),
+        ("Local MCP", "local_mcp_url"),
+        ("Public MCP", "public_mcp_url"),
+        ("Database", "database_path"),
+        ("Log", "log_path"),
+    ):
+        if result.get(key):
+            typer.echo(f"{label}: {result[key]}")
 
 
 _CONFIG_TEMPLATE = """# Research Gateway global configuration. Keep this file outside Git.
@@ -290,6 +444,18 @@ port = 8765
 
 [database]
 path = "~/.research-gateway/data/research_gateway.db"
+
+[logging]
+# path = "~/.research-gateway/data/logs/research-gateway.log"
+level = "INFO"
+
+[backup]
+enabled = true
+on_service_start = true
+retention_count = 20
+
+[runtime]
+# directory = "~/.research-gateway/data/runtime"
 
 [mcp_remote_auth]
 mode = "static_bearer"
@@ -318,11 +484,14 @@ index_path = "~/.research-gateway/indexes/acl/index.json"
 
 [ieee_xplore]
 enabled = false
+approval_status = "pending"
 api_key = ""
+query_field = "querytext"
 
 [wos]
 enabled = false
 mode = "starter"
+approval_status = "pending"
 api_key = ""
 
 [acm_dl]
