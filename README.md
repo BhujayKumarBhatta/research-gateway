@@ -83,13 +83,14 @@ contains `data/research_gateway.db`, rotating logs, Excel backups, and process s
 - IEEE and both Web of Science modes remain unavailable for live use until their
   external approval is active. This does not disable their fixture/contract tests.
 - ACM Digital Library remains honestly unavailable because an official supported search API has not been verified. Crossref or OpenAlex is not presented as ACM search.
-- Zotero checks the remote library by DOI, then by normalized title and year, before
-  creating anything. It links a matching item back to Evidence, defaults to dry-run,
-  skips durable existing links, and never deletes or uploads PDFs. A collection is
-  optional: with no collection configured, new items are written to the personal
-  library root. Search results include `item_key`, so the exact result can be passed
-  to `zotero_get_item`. Zotero's per-item write failures are returned and audited as
-  failures instead of being reported as a successful zero-item sync.
+- Zotero checks durable links, DOI, arXiv ID, and normalized bibliographic identity
+  before creating an approved item. One item can belong to several collections and
+  retain extensible research tags without duplication. Search results include the
+  `item_key`, version, tags, and collection keys. Citation tools return structured
+  metadata and Zotero-rendered CSL citations from that same item. Item and collection
+  deletion default to dry-run, use version protection, refuse implicit attachment
+  deletion, and are audited. Zotero never uploads PDFs. See the complete
+  [Zotero workflow](docs/zotero.md).
 - GitHub supports bounded reads and branch-to-commit-to-pull-request proposals. It defaults to dry-run and never force-pushes, deletes, merges, changes settings, or writes directly to the default branch.
 
 The Sources page and `source_list` MCP tool show actual availability, capabilities, paging notes, and retention policy without displaying credentials.

@@ -20,7 +20,7 @@ from research_gateway.domain.models import (
     SourceRecord,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _SAFE_TABLES = {
     "studies",
     "topics",
@@ -33,6 +33,7 @@ _SAFE_TABLES = {
     "audit_events",
     "possible_duplicates",
     "zotero_links",
+    "citation_references",
     "github_operations",
 }
 
@@ -244,6 +245,22 @@ class EvidenceDatabase:
                     synced_at TEXT NOT NULL,
                     PRIMARY KEY(evidence_id, library_type, library_id)
                 );
+                CREATE INDEX IF NOT EXISTS idx_zotero_links_item
+                    ON zotero_links(library_type, library_id, item_key);
+                CREATE TABLE IF NOT EXISTS citation_references (
+                    citation_reference_id TEXT PRIMARY KEY,
+                    manuscript TEXT NOT NULL,
+                    citation_location TEXT,
+                    library_type TEXT NOT NULL,
+                    library_id TEXT NOT NULL,
+                    item_key TEXT NOT NULL,
+                    evidence_id TEXT REFERENCES evidence(evidence_id) ON DELETE SET NULL,
+                    identifier TEXT,
+                    rationale TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_citation_references_manuscript
+                    ON citation_references(manuscript, created_at);
                 CREATE TABLE IF NOT EXISTS github_operations (
                     operation_id TEXT PRIMARY KEY,
                     operation TEXT NOT NULL,
@@ -996,6 +1013,89 @@ class EvidenceDatabase:
             await connection.commit()
         finally:
             await connection.close()
+
+    async def get_zotero_link_by_item_key(
+        self, item_key: str, library_type: str, library_id: str
+    ) -> dict[str, Any] | None:
+        return await self._fetch_one(
+            "SELECT * FROM zotero_links WHERE item_key=? AND library_type=? AND library_id=? "
+            "ORDER BY synced_at DESC LIMIT 1",
+            (item_key, library_type, library_id),
+        )
+
+    async def delete_zotero_links_by_item_key(
+        self, item_key: str, library_type: str, library_id: str
+    ) -> int:
+        connection = await self._connect()
+        try:
+            cursor = await connection.execute(
+                "DELETE FROM zotero_links WHERE item_key=? AND library_type=? AND library_id=?",
+                (item_key, library_type, library_id),
+            )
+            await connection.commit()
+            return int(cursor.rowcount)
+        finally:
+            await connection.close()
+
+    async def save_citation_reference(
+        self,
+        *,
+        manuscript: str,
+        citation_location: str | None,
+        library_type: str,
+        library_id: str,
+        item_key: str,
+        evidence_id: str | None,
+        identifier: str | None,
+        rationale: str = "",
+    ) -> dict[str, Any]:
+        citation_reference_id = str(uuid.uuid4())
+        created_at = _utc_text()
+        connection = await self._connect()
+        try:
+            await connection.execute(
+                "INSERT INTO citation_references VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    citation_reference_id,
+                    manuscript,
+                    citation_location,
+                    library_type,
+                    library_id,
+                    item_key,
+                    evidence_id,
+                    identifier,
+                    rationale,
+                    created_at,
+                ),
+            )
+            await connection.commit()
+        finally:
+            await connection.close()
+        return {
+            "citation_reference_id": citation_reference_id,
+            "manuscript": manuscript,
+            "citation_location": citation_location,
+            "library_type": library_type,
+            "library_id": library_id,
+            "item_key": item_key,
+            "evidence_id": evidence_id,
+            "identifier": identifier,
+            "rationale": rationale,
+            "created_at": created_at,
+        }
+
+    async def list_citation_references(
+        self, *, manuscript: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        if manuscript:
+            return await self._fetch_all(
+                "SELECT * FROM citation_references WHERE manuscript=? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (manuscript, limit),
+            )
+        return await self._fetch_all(
+            "SELECT * FROM citation_references ORDER BY created_at DESC LIMIT ?", (limit,)
+        )
 
     async def record_github_operation(
         self,

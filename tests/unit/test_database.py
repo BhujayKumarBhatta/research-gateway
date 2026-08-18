@@ -18,7 +18,7 @@ async def database(tmp_path: Path) -> EvidenceDatabase:
 
 @pytest.mark.asyncio
 async def test_migrations_create_versioned_schema(database: EvidenceDatabase) -> None:
-    assert await database.user_version() >= 2
+    assert await database.user_version() >= 3
     tables = await database.table_names()
     assert {
         "studies",
@@ -29,6 +29,8 @@ async def test_migrations_create_versioned_schema(database: EvidenceDatabase) ->
         "evidence_identifiers",
         "screening_events",
         "audit_events",
+        "zotero_links",
+        "citation_references",
     }.issubset(tables)
 
 

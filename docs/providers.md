@@ -11,7 +11,7 @@ Each source reports whether it is enabled, configured, and actually available. â
 | Web of Science Starter | [Official Starter API](https://developer.clarivate.com/apis/wos-starter/swagger), including `/documents`, `q`, `db`, `limit`, and `page` | Clarivate key plus active Starter approval | Minimal licensed raw metadata |
 | Web of Science Expanded | [Official Expanded API](https://developer.clarivate.com/apis/wos/swagger), including `databaseId`, `usrQuery`, `count`, and `firstRecord` | Clarivate key plus active Expanded approval | Minimal licensed raw metadata |
 | ACM Digital Library | Unavailable until a supported official search mechanism is verified | Unknown | None |
-| Zotero | Final-corpus item sync, dry-run by default | Library-scoped key | Durable local item links; no deletes or PDF uploads |
+| Zotero | Approved-item and final-corpus workflow with guarded collection, tag, citation, and deletion tools | Library-scoped key | Durable bidirectional item links and manuscript citation provenance; no PDF uploads |
 | GitHub | Reads and branch-to-commit-to-pull-request writes | Fine-grained token | Safe operation summaries; no force/delete/merge/settings writes |
 
 Scopus is the mandatory live scholarly source for release. arXiv and ACL are the open-source release checks. IEEE and both Web of Science contracts always run against deterministic fixtures in CI. Their live checks run only when the corresponding external approval is active; otherwise the command reports that the live test is deferred instead of misreporting an implementation failure.
@@ -35,3 +35,5 @@ sync sees that durable link and does not create a duplicate. Zotero can return H
 200 for a batch in which an individual item failed; Research Gateway checks every
 item result and records such a write as failed with a safe status, category,
 operation, and stage.
+
+The complete approved-reference workflow is described in [Zotero research and bibliography workflow](zotero.md). Collection and item deletion are available only behind a dry run, version protection, non-empty checks, and attachment refusal.
