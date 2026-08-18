@@ -133,7 +133,7 @@ uv run research-gateway service start --tunnel
 uv run research-gateway tunnel-status
 ```
 
-The server still binds to loopback. The public hostname reaches only `/health`, OAuth discovery and approval routes, and OAuth-protected `/mcp`; `/ui` and `/api/v1` remain local. The password is kept as a strong salted hash. Authorization codes and tokens are stored only as keyed digests, which are one-way fingerprints used for lookup. If a browser repeats the same successful approval POST immediately, the gateway returns the same redirect for up to 90 seconds. This makes a transport retry harmless while the authorization code itself remains redeemable only once.
+The server still binds to loopback. The public hostname reaches only `/health`, OAuth discovery and approval routes, and OAuth-protected `/mcp`; `/ui` and `/api/v1` remain local. The password is kept as a strong salted hash. Authorization codes and tokens are stored only as keyed digests, which are one-way fingerprints used for lookup. The approval page can submit only to Research Gateway and the exact origin of the registered callback; callback paths, queries, wildcards, and unrelated sites are not added to its browser security policy. If a browser repeats the same successful approval POST immediately, the gateway returns the same redirect for up to 90 seconds. This makes a transport retry harmless while the authorization code itself remains redeemable only once.
 
 In ChatGPT create a custom MCP connector with **Name = Research Gateway**, **Server URL = the displayed public URL followed by `/mcp`**, and **Authentication = OAuth**. Leave Advanced OAuth Settings automatic; the gateway publishes protected-resource and authorization-server metadata. Static bearer mode remains available for older clients by setting `[mcp_remote_auth] mode = "static_bearer"`, but it is not mixed with OAuth.
 
@@ -169,6 +169,10 @@ uv run research-gateway acceptance oauth-scopus-ngrok
 ```
 
 Live gates use temporary databases. They do not print configured secrets or alter normal research data. `live-licensed` runs an approved Web of Science or IEEE gate and otherwise reports `LIVE TEST DEFERRED — EXTERNAL APPROVAL PENDING` separately for Starter, Expanded, and IEEE. GitHub Actions uses fixtures and mocks only; it requires no external credentials.
+
+`oauth-browser-ngrok` deliberately redirects Chromium from the public ngrok origin
+to a separate loopback callback origin. It proves that the registered callback,
+state check, PKCE exchange, and authenticated MCP call work across origins.
 
 ## Configuration and limits
 

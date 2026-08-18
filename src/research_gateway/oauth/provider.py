@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import html
+import ipaddress
 import logging
+import re
 import secrets
 import time
 from dataclasses import dataclass
@@ -28,18 +30,64 @@ from research_gateway.oauth.store import OAuthStore
 logger = logging.getLogger(__name__)
 
 
+_DNS_HOST = re.compile(
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*"
+)
+
+
 @dataclass(frozen=True)
-class ApprovalRequest:
-    request_id: str
-    client_name: str
-    scope: str
+class ApprovalPage:
+    content: str
+    csrf: str
+    callback_origin: str
 
 
 @dataclass(frozen=True)
 class ApprovalResult:
     redirect_url: str
+    callback_origin: str
     correlation_id: str
     replayed: bool
+
+
+def validated_redirect_origin(redirect_uri: str) -> str:
+    """Return one CSP-safe origin for an allowed registered OAuth redirect URI."""
+    try:
+        parsed = urlparse(redirect_uri)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("OAuth redirect URI is malformed.") from error
+    if (
+        not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+    ):
+        raise ValueError("OAuth redirect URI cannot produce a safe callback origin.")
+
+    scheme = parsed.scheme.casefold()
+    host = hostname.casefold()
+    loopback = host in {"127.0.0.1", "localhost", "::1"}
+    if scheme != "https" and not (scheme == "http" and loopback):
+        raise ValueError("OAuth redirect URI must use HTTPS or loopback HTTP.")
+
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            serialized_host = host.encode("idna").decode("ascii")
+        except UnicodeError as error:
+            raise ValueError("OAuth redirect URI has an invalid host.") from error
+        if not _DNS_HOST.fullmatch(serialized_host):
+            raise ValueError("OAuth redirect URI has an invalid host.") from None
+    else:
+        if getattr(address, "scope_id", None):
+            raise ValueError("OAuth redirect URI cannot use an IPv6 scope identifier.")
+        serialized_host = f"[{address.compressed}]" if address.version == 6 else address.compressed
+
+    authority = serialized_host if port is None else f"{serialized_host}:{port}"
+    return f"{scheme}://{authority}"
 
 
 class SingleUserOAuthProvider(
@@ -72,15 +120,12 @@ class SingleUserOAuthProvider(
         if not client_info.redirect_uris:
             raise RegistrationError("invalid_redirect_uri", "At least one redirect URI is required")
         for redirect in client_info.redirect_uris:
-            parsed = urlparse(str(redirect))
-            loopback = parsed.hostname in {"127.0.0.1", "localhost", "::1"}
-            insecure_non_loopback = parsed.scheme != "https" and not (
-                loopback and parsed.scheme == "http"
-            )
-            if parsed.fragment or insecure_non_loopback:
+            try:
+                validated_redirect_origin(str(redirect))
+            except ValueError as error:
                 raise RegistrationError(
                     "invalid_redirect_uri", "Redirect URIs must use HTTPS or loopback HTTP"
-                )
+                ) from error
         # This single-user server registers public PKCE clients. Avoid retaining a
         # dynamically generated client secret that is unnecessary for this flow.
         client_info.token_endpoint_auth_method = "none"
@@ -118,15 +163,20 @@ class SingleUserOAuthProvider(
         )
         return f"{self.settings.issuer_url.rstrip('/')}/oauth/authorize?request={quote(request_id)}"
 
-    def approval_page(self, request_id: str) -> tuple[str, str]:
+    def approval_page(self, request_id: str) -> ApprovalPage:
         payload = self.store.get_record("approval", self._digest(request_id))
         if not payload:
             raise ValueError("Authorization request is invalid or expired.")
+        callback_origin = validated_redirect_origin(str(payload["redirect_uri"]))
         client_name = html.escape(str(payload.get("client_name") or "ChatGPT"))
         scope = html.escape(" ".join(payload.get("scopes") or [self.settings.scope]))
         csrf = csrf_value(self._sealing_secret, request_id)
         logger.info("oauth approval page served oauth_flow=%s", self.correlation_id(request_id))
-        return self._render_page(request_id, csrf, client_name, scope), csrf
+        return ApprovalPage(
+            content=self._render_page(request_id, csrf, client_name, scope),
+            csrf=csrf,
+            callback_origin=callback_origin,
+        )
 
     def approve(
         self,
@@ -148,13 +198,16 @@ class SingleUserOAuthProvider(
             completed = self.store.get_record("approval_complete", approval_digest)
             if not completed:
                 raise ValueError("Authorization request is invalid, expired, or already used.")
+            callback_origin = validated_redirect_origin(str(completed["redirect_uri"]))
             logger.info("oauth approval duplicate/replay detected oauth_flow=%s", correlation)
             return ApprovalResult(
                 redirect_url=self._completed_redirect(request_id, completed),
+                callback_origin=callback_origin,
                 correlation_id=correlation,
                 replayed=True,
             )
         redirect_uri = str(payload["redirect_uri"])
+        callback_origin = validated_redirect_origin(redirect_uri)
         state = payload.get("state")
         if decision != "allow":
             consumed = self.store.consume_record("approval", approval_digest)
@@ -167,6 +220,7 @@ class SingleUserOAuthProvider(
                     error_description="Access was not approved",
                     state=state,
                 ),
+                callback_origin=callback_origin,
                 correlation_id=correlation,
                 replayed=False,
             )
@@ -205,6 +259,7 @@ class SingleUserOAuthProvider(
             logger.info("oauth approval accepted oauth_flow=%s", correlation)
         return ApprovalResult(
             redirect_url=self._completed_redirect(request_id, saved_completion),
+            callback_origin=validated_redirect_origin(str(saved_completion["redirect_uri"])),
             correlation_id=correlation,
             replayed=outcome == "duplicate",
         )

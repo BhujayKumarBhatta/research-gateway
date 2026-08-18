@@ -12,10 +12,16 @@ let page;
 
 function record(response) {
   const url = new URL(response.url());
-  if (![input.gateway_origin, input.callback_origin].includes(url.origin)) {
+  let target;
+  if (url.origin === input.gateway_origin) {
+    target = "gateway";
+  } else if (url.origin === input.callback_origin) {
+    target = "cross-origin callback";
+  } else {
     return;
   }
   events.push({
+    target,
     method: response.request().method(),
     path: url.pathname,
     status: response.status(),

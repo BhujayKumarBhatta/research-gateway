@@ -105,7 +105,7 @@ uv run research-gateway service status \
 
 `oauth-init` asks for the authorization password without echoing it and stores only a strong salted hash. `--generate-password` is also available; that explicit command displays the generated password once. Store it in a password manager.
 
-The public `/mcp` endpoint first returns an authorization challenge. A client then discovers the OAuth server, registers, opens the small Research Gateway approval page, and exchanges a one-use code protected by PKCE (a verifier that prevents a stolen code from being redeemed). Access tokens expire after 60 minutes by default, while rotated refresh tokens can renew the connection for 30 days. A browser or proxy can repeat one successful approval submission during a short 90-second completion window and receive the same redirect. This is an idempotent retry (repeating the request has the same result); it does not make the code reusable, and a second token exchange still fails.
+The public `/mcp` endpoint first returns an authorization challenge. A client then discovers the OAuth server, registers, opens the small Research Gateway approval page, and exchanges a one-use code protected by PKCE (a verifier that prevents a stolen code from being redeemed). The approval page's browser policy permits its form to reach only Research Gateway and the exact origin taken from the validated registered callback. It does not add the callback path or query and does not use a wildcard. Access tokens expire after 60 minutes by default, while rotated refresh tokens can renew the connection for 30 days. A browser or proxy can repeat one successful approval submission during a short 90-second completion window and receive the same redirect. This is an idempotent retry (repeating the request has the same result); it does not make the code reusable, and a second token exchange still fails.
 
 ChatGPT configuration:
 
@@ -141,4 +141,4 @@ uv run research-gateway acceptance oauth-browser-ngrok
 uv run research-gateway acceptance oauth-scopus-ngrok
 ```
 
-Fixture acceptance requires no real credential. The live gates use a temporary database and do not pollute normal research data. `live-licensed` reports separate results for Web of Science Starter, Web of Science Expanded, and IEEE Xplore. Pending external approval is reported as a deferred live test; fixture and contract coverage still has to pass.
+Fixture acceptance requires no real credential. The live gates use a temporary database and do not pollute normal research data. `oauth-browser-ngrok` uses a separate loopback callback receiver, so real Chromium must leave the public ngrok origin before the code is exchanged and `gateway_status` is called. `live-licensed` reports separate results for Web of Science Starter, Web of Science Expanded, and IEEE Xplore. Pending external approval is reported as a deferred live test; fixture and contract coverage still has to pass.

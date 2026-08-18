@@ -9,6 +9,7 @@ Remote access is narrow:
 - the application binds to loopback (`127.0.0.1`) by default;
 - the ngrok hostname exposes `/health`, `/mcp`, and only the required OAuth routes unless a user deliberately opts into more;
 - recommended remote MCP uses OAuth authorization code with PKCE, one-use codes, short access tokens, and rotating refresh tokens;
+- the approval page permits form navigation only to itself and the exact validated callback origin, never a wildcard, path, query, or unrelated host;
 - an immediate duplicate approval returns the same redirect only during a short completion window, while its code remains one-use;
 - raw OAuth codes and tokens are never stored in the Evidence Store, logs, Excel backups, or the OAuth state database;
 - static bearer authentication remains a separate compatibility mode and is never accepted alongside OAuth;

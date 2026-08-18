@@ -15,7 +15,7 @@ from urllib.parse import urlencode
 import httpx
 import httpx2
 import uvicorn
-from fastapi import Request
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 from mcp.client import Client
 from mcp.client.streamable_http import streamable_http_client
@@ -397,40 +397,38 @@ async def run_oauth_browser_ngrok(settings: Settings) -> None:
     with tempfile.TemporaryDirectory(prefix="research-gateway-oauth-browser-") as directory:
         root = Path(directory)
         temporary, password = _temporary_oauth_settings(settings, root)
-        callback_path = "/oauth/acceptance-callback"
+        callback_port = _free_port()
+        callback_origin = f"http://127.0.0.1:{callback_port}"
+        callback_path = "/oauth/callback"
+        callback_url = f"{callback_origin}{callback_path}"
         callback_result: asyncio.Future[dict[str, str]] = asyncio.get_running_loop().create_future()
+        callback_app = FastAPI()
+
+        @callback_app.get(callback_path, response_class=HTMLResponse)
+        async def oauth_callback(request: Request) -> HTMLResponse:
+            values = {key: value for key, value in request.query_params.items()}
+            if not callback_result.done():
+                callback_result.set_result(values)
+            return HTMLResponse(
+                "<!doctype html><html><body>"
+                "<p data-oauth-callback='received'>OAuth callback received.</p>"
+                "</body></html>"
+            )
 
         tunnel = NgrokTunnel(temporary, state_path=root / "tunnel.json")
         public = await tunnel.astart()
         try:
             if not public.public_url or not public.public_mcp_url:
                 raise RuntimeError("ngrok did not provide a public MCP URL.")
-            callback_origin = public.public_url
-            callback_url = f"{callback_origin}{callback_path}"
+            if callback_origin == public.public_url:
+                raise RuntimeError("OAuth browser callback must be cross-origin.")
             runtime_settings = with_oauth_urls(temporary, public.public_url)
             runtime = GatewayRuntime.build(runtime_settings)
             gateway_app = create_app(runtime_settings, runtime)
-
-            async def oauth_callback(request: Request) -> HTMLResponse:
-                values = {key: value for key, value in request.query_params.items()}
-                if not callback_result.done():
-                    callback_result.set_result(values)
-                return HTMLResponse(
-                    "<!doctype html><html><body>"
-                    "<p data-oauth-callback='received'>OAuth callback received.</p>"
-                    "</body></html>"
-                )
-
-            gateway_app.add_api_route(callback_path, oauth_callback, methods=["GET"])
-            callback_route = gateway_app.router.routes.pop()
-            mcp_mount_index = next(
-                index
-                for index, route in enumerate(gateway_app.router.routes)
-                if getattr(route, "name", None) == "mcp"
-            )
-            gateway_app.router.routes.insert(mcp_mount_index, callback_route)
-
-            async with _serve(gateway_app, runtime_settings.service.port):
+            async with (
+                _serve(gateway_app, runtime_settings.service.port),
+                _serve(callback_app, callback_port),
+            ):
                 await _wait_for_health(public.public_health_url or "")
                 verifier = secrets.token_urlsafe(64)
                 challenge = (
@@ -508,10 +506,33 @@ async def run_oauth_browser_ngrok(settings: Settings) -> None:
                 events = browser_result.get("events")
                 if not isinstance(events, list):
                     raise RuntimeError("Playwright did not return safe browser network events.")
+                authorize_responses = [
+                    event
+                    for event in events
+                    if isinstance(event, dict)
+                    and event.get("target") == "gateway"
+                    and event.get("method") == "GET"
+                    and event.get("path") == "/authorize"
+                    and event.get("status") == 302
+                ]
+                approval_pages = [
+                    event
+                    for event in events
+                    if isinstance(event, dict)
+                    and event.get("target") == "gateway"
+                    and event.get("method") == "GET"
+                    and event.get("path") == "/oauth/authorize"
+                    and event.get("status") == 200
+                ]
+                if not authorize_responses or not approval_pages:
+                    raise RuntimeError(
+                        "Browser did not reach the OAuth approval page through ngrok."
+                    )
                 approval_responses = [
                     event
                     for event in events
                     if isinstance(event, dict)
+                    and event.get("target") == "gateway"
                     and event.get("method") == "POST"
                     and event.get("path") == "/oauth/authorize"
                 ]
@@ -519,11 +540,23 @@ async def run_oauth_browser_ngrok(settings: Settings) -> None:
                     event.get("status") != 302 for event in approval_responses
                 ):
                     raise RuntimeError("Browser approval POST did not return a safe redirect.")
+                callback_responses = [
+                    event
+                    for event in events
+                    if isinstance(event, dict)
+                    and event.get("target") == "cross-origin callback"
+                    and event.get("method") == "GET"
+                    and event.get("path") == callback_path
+                    and event.get("status") == 200
+                ]
+                if not callback_responses:
+                    raise RuntimeError("Browser did not reach the cross-origin OAuth callback.")
                 for event in events:
                     if isinstance(event, dict):
                         print(
-                            "Browser network: "
-                            f"{event.get('method')} {event.get('path')} -> {event.get('status')}"
+                            "Browser: "
+                            f"{event.get('method')} {event.get('target')} "
+                            f"{event.get('path')} -> {event.get('status')}"
                         )
                 store_bytes = runtime_settings.mcp_oauth.store_path.read_bytes()
                 for raw_secret in (
@@ -535,7 +568,7 @@ async def run_oauth_browser_ngrok(settings: Settings) -> None:
                 ):
                     if raw_secret.encode() in store_bytes:
                         raise RuntimeError("A raw OAuth browser secret leaked into state storage.")
-                print("OAUTH BROWSER NGROK ACCEPTANCE: PASS")
+                print("OAUTH CROSS-ORIGIN BROWSER NGROK ACCEPTANCE: PASS")
         finally:
             await tunnel.astop()
 
@@ -573,7 +606,8 @@ async def _run_playwright_browser(script: Path, payload: dict[str, str]) -> dict
         for event in result.get("events", []):
             if isinstance(event, dict):
                 safe_events.append(
-                    f"{event.get('method')} {event.get('path')} -> {event.get('status')}"
+                    f"{event.get('method')} {event.get('target')} "
+                    f"{event.get('path')} -> {event.get('status')}"
                 )
         location = result.get("location")
         safe_location = ""

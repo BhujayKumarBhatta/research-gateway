@@ -7,20 +7,29 @@ from mcp.server.mcpserver import MCPServer
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 
-from research_gateway.oauth.provider import SingleUserOAuthProvider
+from research_gateway.oauth.provider import SingleUserOAuthProvider, validated_redirect_origin
 
 logger = logging.getLogger(__name__)
 
 _SECURITY_HEADERS = {
     "Cache-Control": "no-store",
-    "Content-Security-Policy": (
-        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; "
-        "base-uri 'none'; frame-ancestors 'none'"
-    ),
     "Referrer-Policy": "no-referrer",
     "X-Content-Type-Options": "nosniff",
 }
 _CSRF_COOKIE = "rg_oauth_csrf"
+
+
+def _security_headers(callback_origin: str | None = None) -> dict[str, str]:
+    form_action = "form-action 'self'"
+    if callback_origin:
+        form_action += f" {validated_redirect_origin(callback_origin)}"
+    return {
+        **_SECURITY_HEADERS,
+        "Content-Security-Policy": (
+            f"default-src 'none'; style-src 'unsafe-inline'; {form_action}; "
+            "base-uri 'none'; frame-ancestors 'none'"
+        ),
+    }
 
 
 def install_approval_routes(server: MCPServer[None], provider: SingleUserOAuthProvider) -> None:
@@ -28,17 +37,17 @@ def install_approval_routes(server: MCPServer[None], provider: SingleUserOAuthPr
     async def approval_page(request: Request) -> Response:
         request_id = request.query_params.get("request", "")
         try:
-            content, csrf = provider.approval_page(request_id)
+            page = provider.approval_page(request_id)
         except ValueError:
             return PlainTextResponse(
                 "Authorization request is invalid or expired.",
                 status_code=400,
-                headers=_SECURITY_HEADERS,
+                headers=_security_headers(),
             )
-        response = HTMLResponse(content, headers=_SECURITY_HEADERS)
+        response = HTMLResponse(page.content, headers=_security_headers(page.callback_origin))
         response.set_cookie(
             _CSRF_COOKIE,
-            csrf,
+            page.csrf,
             httponly=True,
             secure=provider.settings.issuer_url.startswith("https://"),
             samesite="strict",
@@ -62,7 +71,7 @@ def install_approval_routes(server: MCPServer[None], provider: SingleUserOAuthPr
             return PlainTextResponse(
                 "Authorization request validation failed.",
                 status_code=400,
-                headers=_SECURITY_HEADERS,
+                headers=_security_headers(),
             )
         try:
             result = provider.approve(
@@ -75,16 +84,20 @@ def install_approval_routes(server: MCPServer[None], provider: SingleUserOAuthPr
             return PlainTextResponse(
                 "Authorization password is incorrect.",
                 status_code=401,
-                headers=_SECURITY_HEADERS,
+                headers=_security_headers(),
             )
         except ValueError:
             return PlainTextResponse(
                 "Authorization request is invalid, expired, or already used.",
                 status_code=400,
-                headers=_SECURITY_HEADERS,
+                headers=_security_headers(),
             )
         logger.info("oauth callback redirect issued oauth_flow=%s", result.correlation_id)
-        response = RedirectResponse(result.redirect_url, status_code=302, headers=_SECURITY_HEADERS)
+        response = RedirectResponse(
+            result.redirect_url,
+            status_code=302,
+            headers=_security_headers(result.callback_origin),
+        )
         if fields["decision"] == "allow":
             response.set_cookie(
                 _CSRF_COOKIE,
