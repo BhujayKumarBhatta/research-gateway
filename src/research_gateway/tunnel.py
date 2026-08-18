@@ -71,13 +71,14 @@ class NgrokTunnel:
             raise RuntimeError("The ngrok tunnel is disabled in configuration.")
         if not self.settings.tunnel.configured:
             raise RuntimeError("The ngrok authtoken is not configured.")
-        if (
-            not self.settings.mcp_remote_auth.configured
-            and not self.settings.mcp_remote_auth.allow_unauthenticated
-        ):
-            raise RuntimeError(
-                "Remote MCP bearer authentication must be configured before tunneling."
-            )
+        auth = self.settings.mcp_remote_auth
+        if not auth.allow_unauthenticated:
+            if auth.mode == "static_bearer" and not auth.token.get_secret_value():
+                raise RuntimeError(
+                    "Remote MCP bearer authentication must be configured before tunneling."
+                )
+            if auth.mode == "oauth" and not self.settings.mcp_oauth.configured:
+                raise RuntimeError("Remote MCP OAuth must be initialized before tunneling.")
         if self.settings.service.host not in {"127.0.0.1", "localhost", "::1"}:
             raise RuntimeError("The local service must bind to loopback before tunneling.")
         options: dict[str, object] = {
@@ -143,6 +144,18 @@ class NgrokTunnel:
 
     def _exposed_paths(self) -> list[str]:
         paths = ["/health", "/mcp"]
+        if self.settings.mcp_remote_auth.mode == "oauth":
+            paths.extend(
+                [
+                    "/.well-known/oauth-protected-resource/mcp",
+                    "/.well-known/oauth-authorization-server",
+                    "/authorize",
+                    "/token",
+                    "/register",
+                    "/revoke",
+                    "/oauth/authorize",
+                ]
+            )
         if self.settings.tunnel.expose_ui:
             paths.extend(["/ui", "/api/v1"])
         return paths

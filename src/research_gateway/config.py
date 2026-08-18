@@ -76,13 +76,42 @@ class TunnelSettings(BaseModel):
 
 
 class McpRemoteAuthSettings(BaseModel):
-    mode: Literal["static_bearer"] = "static_bearer"
+    mode: Literal["static_bearer", "oauth"] = "static_bearer"
     token: SecretStr = SecretStr("")
     allow_unauthenticated: bool = False
 
     @property
     def configured(self) -> bool:
-        return bool(self.token.get_secret_value())
+        return self.mode == "static_bearer" and bool(self.token.get_secret_value())
+
+
+class McpOAuthSettings(BaseModel):
+    enabled: bool = False
+    issuer_url: str = ""
+    resource_url: str = ""
+    scope: str = "research-gateway"
+    admin_password_hash: SecretStr = SecretStr("")
+    signing_secret: SecretStr = SecretStr("")
+    sealing_secret: SecretStr = SecretStr("")
+    store_path: Path | None = None
+    access_token_minutes: int = Field(default=60, ge=1, le=1440)
+    refresh_token_days: int = Field(default=30, ge=1, le=365)
+    authorization_code_seconds: int = Field(default=300, ge=60, le=600)
+    approval_request_seconds: int = Field(default=600, ge=60, le=1800)
+
+    @field_validator("store_path")
+    @classmethod
+    def expand_optional_path(cls, value: Path | None) -> Path | None:
+        return value.expanduser().absolute() if value else None
+
+    @property
+    def configured(self) -> bool:
+        return bool(
+            self.enabled
+            and self.admin_password_hash.get_secret_value()
+            and self.signing_secret.get_secret_value()
+            and self.sealing_secret.get_secret_value()
+        )
 
 
 class ScopusSettings(BaseModel):
@@ -189,6 +218,7 @@ class Settings(BaseModel):
     runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
     tunnel: TunnelSettings = Field(default_factory=TunnelSettings)
     mcp_remote_auth: McpRemoteAuthSettings = Field(default_factory=McpRemoteAuthSettings)
+    mcp_oauth: McpOAuthSettings = Field(default_factory=McpOAuthSettings)
     scopus: ScopusSettings = Field(default_factory=ScopusSettings)
     wos: WosSettings = Field(default_factory=WosSettings)
     ieee_xplore: IeeeSettings = Field(default_factory=IeeeSettings)
@@ -199,10 +229,21 @@ class Settings(BaseModel):
     github: GithubSettings = Field(default_factory=GithubSettings)
     retention: RetentionSettings = Field(default_factory=RetentionSettings)
 
+    @property
+    def remote_auth_configured(self) -> bool:
+        if self.mcp_remote_auth.allow_unauthenticated:
+            return True
+        if self.mcp_remote_auth.mode == "oauth":
+            return self.mcp_oauth.configured
+        return bool(self.mcp_remote_auth.token.get_secret_value())
+
     def secret_values(self) -> list[str]:
         return [
             self.tunnel.authtoken.get_secret_value(),
             self.mcp_remote_auth.token.get_secret_value(),
+            self.mcp_oauth.admin_password_hash.get_secret_value(),
+            self.mcp_oauth.signing_secret.get_secret_value(),
+            self.mcp_oauth.sealing_secret.get_secret_value(),
             self.scopus.api_key.get_secret_value(),
             self.scopus.institutional_token.get_secret_value(),
             self.wos.api_key.get_secret_value(),

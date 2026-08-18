@@ -21,6 +21,7 @@ from research_gateway.config import (
 )
 from research_gateway.db.database import EvidenceDatabase
 from research_gateway.mcp.server import create_mcp_server
+from research_gateway.oauth.setup import initialize_oauth, with_oauth_urls
 from research_gateway.operations.backups import ExcelBackupService
 from research_gateway.operations.logging import configure_logging
 from research_gateway.operations.service import ServiceManager
@@ -63,6 +64,37 @@ def generate_token() -> None:
     typer.echo(generate_remote_token())
 
 
+@app.command("oauth-init")
+def oauth_init(
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+    generate_password: Annotated[
+        bool,
+        typer.Option(
+            "--generate-password",
+            help="Generate and display a one-time OAuth authorization password.",
+        ),
+    ] = False,
+) -> None:
+    """Initialize secure single-user OAuth values in the external global config."""
+    selected = (config or resolve_config_path()).expanduser().absolute()
+    password = None
+    if not generate_password:
+        password = typer.prompt(
+            "OAuth authorization password", hide_input=True, confirmation_prompt=True
+        )
+    try:
+        result = initialize_oauth(selected, password=password, generate_password=generate_password)
+    except (ConfigError, ValueError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(f"OAuth configuration initialized: {result.config_path}")
+    typer.echo(f"OAuth state store: {result.store_path}")
+    if result.generated_password:
+        typer.echo("One-time generated OAuth authorization password (store it securely):")
+        typer.echo(result.generated_password)
+        typer.echo("This password will not be shown again.")
+
+
 @app.command()
 def status(
     config: Annotated[Path | None, typer.Option("--config")] = None,
@@ -73,7 +105,8 @@ def status(
     typer.echo(f"Config: {(config or resolve_config_path()).expanduser().absolute()}")
     typer.echo(f"Database: {settings.database.path}")
     typer.echo(f"Local URL: http://{settings.service.host}:{settings.service.port}")
-    typer.echo(f"Remote auth configured: {settings.mcp_remote_auth.configured}")
+    typer.echo(f"Remote auth mode: {settings.mcp_remote_auth.mode}")
+    typer.echo(f"Remote auth configured: {settings.remote_auth_configured}")
     typer.echo(f"ngrok configured: {settings.tunnel.configured}")
     for source in runtime.source_statuses():
         typer.echo(
@@ -95,7 +128,7 @@ def config_check(
         typer.echo(str(exc), err=True)
         raise typer.Exit(2) from exc
     typer.echo(f"CONFIG CHECK: PASS ({selected.expanduser().absolute()})")
-    typer.echo(f"Remote authentication configured: {settings.mcp_remote_auth.configured}")
+    typer.echo(f"Remote authentication configured: {settings.remote_auth_configured}")
 
 
 @app.command("db-info")
@@ -141,7 +174,8 @@ def doctor(
                     else source.get("unavailable_reason", "unavailable")
                 )
                 typer.echo(f"Source {source['name']}: {readiness}")
-            typer.echo(f"Remote bearer configured: {settings.mcp_remote_auth.configured}")
+            typer.echo(f"Remote auth mode: {settings.mcp_remote_auth.mode}")
+            typer.echo(f"Remote auth configured: {settings.remote_auth_configured}")
             typer.echo(f"ngrok configured: {settings.tunnel.configured}")
         finally:
             await runtime.aclose()
@@ -296,17 +330,26 @@ def serve(
 
         asyncio.run(prepare_backup())
     should_tunnel = settings.tunnel.start_on_serve if tunnel is None else tunnel
-    gateway = GatewayRuntime.build(settings)
-    http_app = create_app(settings, gateway)
     active_tunnel = NgrokTunnel(settings) if should_tunnel else None
     try:
+        base_url = f"http://{settings.service.host}:{settings.service.port}"
         if active_tunnel:
             public = active_tunnel.start()
+            base_url = public.public_url or base_url
             typer.echo(f"Public health: {public.public_health_url}")
             typer.echo(f"Public MCP: {public.public_mcp_url}")
-        typer.echo(f"Local UI: http://{settings.service.host}:{settings.service.port}/ui")
+        runtime_settings = with_oauth_urls(settings, base_url)
+        gateway = GatewayRuntime.build(runtime_settings)
+        http_app = create_app(runtime_settings, gateway)
+        typer.echo(
+            f"Local UI: http://{runtime_settings.service.host}:{runtime_settings.service.port}/ui"
+        )
         typer.echo(f"Log: {log_path}")
-        uvicorn.run(http_app, host=settings.service.host, port=settings.service.port)
+        uvicorn.run(
+            http_app,
+            host=runtime_settings.service.host,
+            port=runtime_settings.service.port,
+        )
     finally:
         if active_tunnel:
             active_tunnel.stop()
@@ -370,6 +413,40 @@ def acceptance_remote_ngrok(
     from research_gateway.acceptance import run_remote_ngrok
 
     asyncio.run(run_remote_ngrok(_load(config), include_scopus=False))
+
+
+@acceptance_app.command("oauth-fixture")
+def acceptance_oauth_fixture() -> None:
+    """Run the deterministic OAuth discovery, PKCE, refresh, and MCP contract."""
+    root = Path(__file__).parents[2]
+    completed = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "tests/contract/test_oauth_http.py"],
+        cwd=root,
+        check=False,
+    )
+    if completed.returncode:
+        raise typer.Exit(completed.returncode)
+    typer.echo("OAUTH FIXTURE ACCEPTANCE: PASS")
+
+
+@acceptance_app.command("oauth-ngrok")
+def acceptance_oauth_ngrok(
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    """Verify OAuth discovery and authenticated MCP through real ngrok."""
+    from research_gateway.acceptance import run_oauth_ngrok
+
+    asyncio.run(run_oauth_ngrok(_load(config), include_scopus=False))
+
+
+@acceptance_app.command("oauth-scopus-ngrok")
+def acceptance_oauth_scopus_ngrok(
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    """Verify the ChatGPT-compatible OAuth MCP path through live Scopus."""
+    from research_gateway.acceptance import run_oauth_ngrok
+
+    asyncio.run(run_oauth_ngrok(_load(config), include_scopus=True))
 
 
 @acceptance_app.command("live-scopus-ngrok")
@@ -461,6 +538,18 @@ retention_count = 20
 mode = "static_bearer"
 token = ""
 allow_unauthenticated = false
+
+[mcp_oauth]
+enabled = false
+issuer_url = ""
+resource_url = ""
+scope = "research-gateway"
+admin_password_hash = ""
+signing_secret = ""
+sealing_secret = ""
+# store_path = "~/.research-gateway/data/runtime/oauth.sqlite3"
+access_token_minutes = 60
+refresh_token_days = 30
 
 [tunnel]
 enabled = true

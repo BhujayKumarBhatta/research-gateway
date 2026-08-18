@@ -22,19 +22,33 @@ from research_gateway.api.schemas import (
 from research_gateway.api.security import RemoteSurfaceMiddleware
 from research_gateway.config import Settings
 from research_gateway.mcp.server import create_mcp_server
+from research_gateway.oauth.provider import SingleUserOAuthProvider
 from research_gateway.runtime import GatewayRuntime
 
 
 def create_app(settings: Settings, runtime: GatewayRuntime | None = None) -> FastAPI:
     gateway = runtime or GatewayRuntime.build(settings)
-    mcp_server = create_mcp_server(gateway)
+    oauth_provider = None
+    if settings.mcp_remote_auth.mode == "oauth":
+        if not settings.mcp_oauth.configured:
+            raise ValueError("OAuth mode requires initialized OAuth secrets and password hash.")
+        if not settings.mcp_oauth.issuer_url or not settings.mcp_oauth.resource_url:
+            raise ValueError(
+                "OAuth mode requires issuer_url and resource_url at application start."
+            )
+        store_path = settings.mcp_oauth.store_path or (
+            (settings.runtime.directory or settings.database.path.parent / "runtime")
+            / "oauth.sqlite3"
+        )
+        oauth_provider = SingleUserOAuthProvider(settings.mcp_oauth, store_path)
+    mcp_server = create_mcp_server(gateway, oauth_provider=oauth_provider)
     mcp_http = mcp_server.streamable_http_app(
         streamable_http_path="/mcp",
         stateless_http=True,
         json_response=True,
         host=settings.service.host,
-        # RemoteSurfaceMiddleware performs host-independent bearer enforcement. This
-        # supports ngrok's generated hostnames while still blocking browser rebinding.
+        # RemoteSurfaceMiddleware performs host-independent authentication and
+        # surface controls while ngrok supplies forwarded-origin headers.
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
 
@@ -285,5 +299,35 @@ def create_app(settings: Settings, runtime: GatewayRuntime | None = None) -> Fas
                 "<h1>Research Gateway</h1><p>The UI has not been built. Run the UI build first.</p>"
             )
 
-    app.mount("/", mcp_http, name="mcp")
+    if oauth_provider:
+        app.mount(
+            "/",
+            _LocalOAuthMcpBridge(app=mcp_http, local_token=oauth_provider.local_transport_token),
+            name="mcp",
+        )
+    else:
+        app.mount("/", mcp_http, name="mcp")
     return app
+
+
+class _LocalOAuthMcpBridge:
+    """Give loopback MCP calls an in-memory credential never exposed through ngrok."""
+
+    def __init__(self, *, app: object, local_token: str) -> None:
+        self.app = app
+        self.local_token = local_token
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        from starlette.datastructures import Headers
+
+        path = scope.get("path", "")
+        headers = Headers(scope=scope)
+        forwarded = bool(headers.get("x-forwarded-for") or headers.get("x-forwarded-host"))
+        local_mcp = not forwarded and (path == "/mcp" or path.startswith("/mcp/"))
+        if local_mcp and not headers.get("authorization"):
+            scope = dict(scope)
+            scope["headers"] = [
+                *scope.get("headers", []),
+                (b"authorization", f"Bearer {self.local_token}".encode()),
+            ]
+        await self.app(scope, receive, send)

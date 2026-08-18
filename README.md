@@ -113,16 +113,19 @@ filter.
 
 ## Private remote MCP through ngrok
 
-The official ngrok Python SDK is integrated; a separately managed ngrok command is not required. Put an ngrok authtoken under `[tunnel]` and a strong static token under `[mcp_remote_auth]`, then run:
+The official ngrok Python SDK is integrated; a separately managed ngrok command is not required. OAuth is the recommended remote mode because it lets ChatGPT discover how to sign in, show a small approval page, and renew access without asking for an arbitrary bearer token.
+
+Put an ngrok authtoken under `[tunnel]`, initialize the external OAuth configuration, and start the service:
 
 ```bash
-uv run research-gateway serve --tunnel
+uv run research-gateway oauth-init
+uv run research-gateway service start --tunnel
 uv run research-gateway tunnel-status
 ```
 
-The server still binds to loopback. The public hostname reaches only `/health` and bearer-protected `/mcp` by default; `/ui` and `/api/v1` remain local. Tokens are sent in an authorization header, never a URL. Ctrl+C closes both the local server and listener.
+The server still binds to loopback. The public hostname reaches only `/health`, OAuth discovery and approval routes, and OAuth-protected `/mcp`; `/ui` and `/api/v1` remain local. The password is kept as a strong salted hash. Authorization codes and tokens are stored only as keyed digests, which are one-way fingerprints used for lookup.
 
-ChatGPT custom-app availability and accepted authentication profiles can depend on the current plan. Passing the remote MCP acceptance proves the public authenticated protocol path; registering that endpoint in ChatGPT remains a separate user action.
+In ChatGPT create a custom MCP connector with **Name = Research Gateway**, **Server URL = the displayed public URL followed by `/mcp`**, and **Authentication = OAuth**. Leave Advanced OAuth Settings automatic; the gateway publishes protected-resource and authorization-server metadata. Static bearer mode remains available for older clients by setting `[mcp_remote_auth] mode = "static_bearer"`, but it is not mixed with OAuth.
 
 ## Tests and release gates
 
@@ -139,6 +142,7 @@ The deterministic gate uses only fake fixture credentials:
 
 ```bash
 uv run research-gateway acceptance fixture
+uv run research-gateway acceptance oauth-fixture
 ```
 
 Run the real local gates after fixture and UI checks are green:
@@ -149,6 +153,8 @@ uv run research-gateway acceptance live-open
 uv run research-gateway acceptance live-licensed
 uv run research-gateway acceptance remote-ngrok
 uv run research-gateway acceptance live-scopus-ngrok
+uv run research-gateway acceptance oauth-ngrok
+uv run research-gateway acceptance oauth-scopus-ngrok
 ```
 
 Live gates use temporary databases. They do not print configured secrets or alter normal research data. `live-licensed` runs an approved Web of Science or IEEE gate and otherwise reports `LIVE TEST DEFERRED — EXTERNAL APPROVAL PENDING` separately for Starter, Expanded, and IEEE. GitHub Actions uses fixtures and mocks only; it requires no external credentials.

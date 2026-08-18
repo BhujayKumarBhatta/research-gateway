@@ -53,8 +53,8 @@ uv run research-gateway service stop
 ```
 
 Use `service start --tunnel` or `service restart --tunnel` for authenticated public
-MCP. The status command prints only safe locations and URLs. It never prints the
-bearer token or provider keys.
+MCP. The status command prints only safe locations and URLs. It never prints OAuth
+tokens, the authorization password, a bearer token, or provider keys.
 
 ## Logs and Excel backups
 
@@ -77,16 +77,39 @@ Save reruns that exact provider query, captures the requested page range, and re
 
 ## Private remote MCP with ngrok
 
-Set `[tunnel] authtoken` and `[mcp_remote_auth] token` in the global file, then run:
+OAuth is the recommended ChatGPT path. Set `[tunnel] authtoken` in the external global file, then initialize the single-user authorization password and secrets:
 
 ```bash
-uv run research-gateway serve --tunnel
-uv run research-gateway tunnel-status
+uv run research-gateway oauth-init \
+  --config /mnt/c/Users/Bhujay_ROG/.research-gateway/config.toml
+uv run research-gateway service start --tunnel \
+  --config /mnt/c/Users/Bhujay_ROG/.research-gateway/config.toml
+uv run research-gateway service status \
+  --config /mnt/c/Users/Bhujay_ROG/.research-gateway/config.toml
 ```
 
-The process prints a public `/mcp` URL and a `/health` URL. By default the public hostname cannot reach `/ui` or `/api/v1`. Remote MCP requests must send the static token in an `Authorization: Bearer ...` header. The token never belongs in the URL.
+`oauth-init` asks for the authorization password without echoing it and stores only a strong salted hash. `--generate-password` is also available; that explicit command displays the generated password once. Store it in a password manager.
 
-Stopping the Python process closes the listener. ChatGPT connection is a separate user action whose availability and authentication choices depend on the current product plan; a working ngrok URL alone is not a claim that ChatGPT registration is complete.
+The public `/mcp` endpoint first returns an authorization challenge. A client then discovers the OAuth server, registers, opens the small Research Gateway approval page, and exchanges a one-use code protected by PKCE (a verifier that prevents a stolen code from being redeemed). Access tokens expire after 60 minutes by default, while rotated refresh tokens can renew the connection for 30 days.
+
+ChatGPT configuration:
+
+- Name: `Research Gateway`
+- Server URL: the `Public MCP` URL printed by service status
+- Authentication: `OAuth`
+- Advanced OAuth Settings: leave automatic
+
+The gateway publishes `/.well-known/oauth-protected-resource/mcp` and `/.well-known/oauth-authorization-server`, so manual endpoint values are normally unnecessary. The public hostname can reach only health, MCP, and required OAuth routes. `/ui` and `/api/v1` remain local.
+
+For an older client that already supports a fixed bearer header, retain the separate legacy mode:
+
+```toml
+[mcp_remote_auth]
+mode = "static_bearer"
+token = "set-only-in-the-external-config"
+```
+
+OAuth mode never accepts the legacy static token, and static mode never accepts OAuth tokens. Stopping the Python process closes the listener.
 
 ## Acceptance commands
 
@@ -97,6 +120,9 @@ uv run research-gateway acceptance live-open
 uv run research-gateway acceptance live-licensed
 uv run research-gateway acceptance remote-ngrok
 uv run research-gateway acceptance live-scopus-ngrok
+uv run research-gateway acceptance oauth-fixture
+uv run research-gateway acceptance oauth-ngrok
+uv run research-gateway acceptance oauth-scopus-ngrok
 ```
 
 Fixture acceptance requires no real credential. The live gates use a temporary database and do not pollute normal research data. `live-licensed` reports separate results for Web of Science Starter, Web of Science Expanded, and IEEE Xplore. Pending external approval is reported as a deferred live test; fixture and contract coverage still has to pass.
