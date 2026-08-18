@@ -8,6 +8,16 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from research_gateway.config import McpRemoteAuthSettings
 
+OAUTH_REMOTE_PATHS = (
+    "/.well-known/oauth-protected-resource",
+    "/.well-known/oauth-authorization-server",
+    "/authorize",
+    "/token",
+    "/register",
+    "/revoke",
+    "/oauth/",
+)
+
 
 class RemoteSurfaceMiddleware:
     """Keep UI/API loopback-only and require a bearer token for remote MCP."""
@@ -24,15 +34,22 @@ class RemoteSurfaceMiddleware:
         headers = Headers(scope=scope)
         remote = _is_remote(headers)
         path = scope.get("path", "")
+        oauth_path = self.auth.mode == "oauth" and any(
+            path == prefix or path.startswith(prefix) for prefix in OAUTH_REMOTE_PATHS
+        )
         if (
             remote
             and not self.expose_ui
             and path != "/health"
-            and not (path == "/mcp" or path.startswith("/mcp/"))
+            and not (path == "/mcp" or path.startswith("/mcp/") or oauth_path)
         ):
             await JSONResponse({"detail": "Not found"}, status_code=404)(scope, receive, send)
             return
-        if remote and (path == "/mcp" or path.startswith("/mcp/")):
+        if (
+            remote
+            and self.auth.mode == "static_bearer"
+            and (path == "/mcp" or path.startswith("/mcp/"))
+        ):
             if self.auth.allow_unauthenticated:
                 await self.app(scope, receive, send)
                 return

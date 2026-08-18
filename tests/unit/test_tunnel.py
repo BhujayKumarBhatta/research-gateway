@@ -53,6 +53,45 @@ def test_tunnel_refuses_to_start_without_remote_auth(tmp_path) -> None:
         NgrokTunnel(settings, backend=Backend(), state_path=tmp_path / "state.json").start()
 
 
+def test_tunnel_oauth_mode_requires_init_and_lists_only_required_routes(tmp_path) -> None:
+    uninitialized = Settings.model_validate(
+        {
+            "tunnel": {"authtoken": "ngrok-secret"},
+            "mcp_remote_auth": {"mode": "oauth"},
+        }
+    )
+    with pytest.raises(RuntimeError, match="OAuth must be initialized"):
+        NgrokTunnel(uninitialized, backend=Backend(), state_path=tmp_path / "missing.json").start()
+
+    settings = Settings.model_validate(
+        {
+            "tunnel": {"authtoken": "ngrok-secret"},
+            "mcp_remote_auth": {"mode": "oauth"},
+            "mcp_oauth": {
+                "enabled": True,
+                "admin_password_hash": "password-hash",
+                "signing_secret": "signing-secret",
+                "sealing_secret": "sealing-secret",
+            },
+        }
+    )
+    status = NgrokTunnel(settings, backend=Backend(), state_path=tmp_path / "oauth.json").start()
+
+    assert status.exposed_paths == [
+        "/health",
+        "/mcp",
+        "/.well-known/oauth-protected-resource/mcp",
+        "/.well-known/oauth-authorization-server",
+        "/authorize",
+        "/token",
+        "/register",
+        "/revoke",
+        "/oauth/authorize",
+    ]
+    assert "/ui" not in status.exposed_paths
+    assert "/api/v1" not in status.exposed_paths
+
+
 @pytest.mark.asyncio
 async def test_tunnel_supports_async_sdk_lifecycle(tmp_path) -> None:
     class AsyncBackend(Backend):

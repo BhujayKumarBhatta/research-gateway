@@ -23,6 +23,18 @@ mode = "static_bearer"
 token = ""
 allow_unauthenticated = false
 
+[mcp_oauth]
+enabled = false
+issuer_url = ""
+resource_url = ""
+scope = "research-gateway"
+admin_password_hash = ""
+signing_secret = ""
+sealing_secret = ""
+# store_path = "~/.research-gateway/data/runtime/oauth.sqlite3"
+access_token_minutes = 60
+refresh_token_days = 30
+
 [tunnel]
 enabled = true
 authtoken = ""

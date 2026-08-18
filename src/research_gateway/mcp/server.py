@@ -3,10 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Literal
 
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.mcpserver import MCPServer
 from mcp_types import ToolAnnotations
 
 from research_gateway.domain.models import ScreeningStatus
+from research_gateway.oauth.provider import SingleUserOAuthProvider
+from research_gateway.oauth.routes import install_approval_routes
 from research_gateway.runtime import GatewayRuntime
 
 READ_ONLY = ToolAnnotations(
@@ -23,7 +26,27 @@ REMOTE_WRITE = ToolAnnotations(
 )
 
 
-def create_mcp_server(runtime: GatewayRuntime) -> MCPServer[None]:
+def create_mcp_server(
+    runtime: GatewayRuntime,
+    *,
+    oauth_provider: SingleUserOAuthProvider | None = None,
+) -> MCPServer[None]:
+    oauth = oauth_provider.settings if oauth_provider else None
+    auth = (
+        AuthSettings(
+            issuer_url=oauth.issuer_url,
+            resource_server_url=oauth.resource_url,
+            client_registration_options=ClientRegistrationOptions(
+                enabled=True,
+                valid_scopes=[oauth.scope],
+                default_scopes=[oauth.scope],
+            ),
+            revocation_options=RevocationOptions(enabled=True),
+            required_scopes=[oauth.scope],
+        )
+        if oauth
+        else None
+    )
     server: MCPServer[None] = MCPServer(
         "research-gateway",
         title="Research Gateway",
@@ -33,7 +56,11 @@ def create_mcp_server(runtime: GatewayRuntime) -> MCPServer[None]:
             "and records permitted metadata. External writes default to dry-run."
         ),
         version="0.1.0",
+        auth_server_provider=oauth_provider,
+        auth=auth,
     )
+    if oauth_provider:
+        install_approval_routes(server, oauth_provider)
 
     @server.tool(
         description="Show each source's real availability, contract, and retention policy.",

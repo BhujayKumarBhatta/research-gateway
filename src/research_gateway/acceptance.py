@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 import socket
 import tempfile
 from collections.abc import AsyncIterator
@@ -17,6 +18,9 @@ from mcp.client.streamable_http import streamable_http_client
 from research_gateway.api.app import create_app
 from research_gateway.config import ConfigError, Settings
 from research_gateway.mcp.server import create_mcp_server
+from research_gateway.oauth.client import oauth_mcp_client
+from research_gateway.oauth.security import hash_password
+from research_gateway.oauth.setup import with_oauth_urls
 from research_gateway.runtime import GatewayRuntime
 from research_gateway.tunnel import NgrokTunnel
 
@@ -237,7 +241,10 @@ async def run_remote_ngrok(settings: Settings, *, include_scopus: bool) -> None:
         raise ConfigError(
             'ngrok is not configured. Add authtoken = "..." under [tunnel] in the global config.'
         )
-    if not settings.mcp_remote_auth.configured:
+    if (
+        settings.mcp_remote_auth.mode != "static_bearer"
+        or not settings.mcp_remote_auth.token.get_secret_value()
+    ):
         raise ConfigError(
             'Remote MCP authentication is not configured. Add token = "..." under '
             "[mcp_remote_auth] in the global config."
@@ -297,6 +304,97 @@ async def run_remote_ngrok(settings: Settings, *, include_scopus: bool) -> None:
                 await tunnel.astop()
 
 
+async def run_oauth_ngrok(settings: Settings, *, include_scopus: bool) -> None:
+    """Exercise the public ngrok surface through the official MCP OAuth client."""
+    if not settings.tunnel.configured:
+        raise ConfigError(
+            'ngrok is not configured. Add authtoken = "..." under [tunnel] in the global config.'
+        )
+    if include_scopus and not settings.scopus.configured:
+        raise ConfigError(
+            'Scopus is not configured. Add api_key = "..." under [scopus] in the global config.'
+        )
+    with tempfile.TemporaryDirectory(prefix="research-gateway-oauth-") as directory:
+        root = Path(directory)
+        password = secrets.token_urlsafe(24)
+        temporary = settings.model_copy(deep=True)
+        temporary.database.path = root / "acceptance.db"
+        temporary.service.host = "127.0.0.1"
+        temporary.service.port = _free_port()
+        temporary.tunnel.expose_ui = False
+        temporary.mcp_remote_auth.mode = "oauth"
+        temporary.mcp_remote_auth.allow_unauthenticated = False
+        temporary.mcp_oauth.enabled = True
+        temporary.mcp_oauth.issuer_url = ""
+        temporary.mcp_oauth.resource_url = ""
+        temporary.mcp_oauth.scope = "research-gateway"
+        temporary.mcp_oauth.admin_password_hash = type(temporary.mcp_oauth.admin_password_hash)(
+            hash_password(password)
+        )
+        temporary.mcp_oauth.signing_secret = type(temporary.mcp_oauth.signing_secret)(
+            secrets.token_urlsafe(48)
+        )
+        temporary.mcp_oauth.sealing_secret = type(temporary.mcp_oauth.sealing_secret)(
+            secrets.token_urlsafe(48)
+        )
+        temporary.mcp_oauth.store_path = root / "oauth.sqlite3"
+        tunnel = NgrokTunnel(temporary, state_path=root / "tunnel.json")
+        public = await tunnel.astart()
+        try:
+            if not public.public_url or not public.public_mcp_url:
+                raise RuntimeError("ngrok did not provide a public MCP URL.")
+            runtime_settings = with_oauth_urls(temporary, public.public_url)
+            runtime = GatewayRuntime.build(runtime_settings)
+            app = create_app(runtime_settings, runtime)
+            async with _serve(app, runtime_settings.service.port):
+                await _wait_for_health(public.public_health_url or "")
+                async with httpx.AsyncClient(timeout=30, follow_redirects=False) as http:
+                    unauthorized = await http.post(public.public_mcp_url, json={})
+                    resource = await http.get(
+                        f"{public.public_url}/.well-known/oauth-protected-resource/mcp"
+                    )
+                    metadata = await http.get(
+                        f"{public.public_url}/.well-known/oauth-authorization-server"
+                    )
+                    hidden_ui = await http.get(f"{public.public_url}/ui")
+                    hidden_api = await http.get(f"{public.public_url}/api/v1/status")
+                challenge = unauthorized.headers.get("www-authenticate", "")
+                if unauthorized.status_code != 401 or "resource_metadata=" not in challenge:
+                    raise RuntimeError("Public MCP did not advertise OAuth resource metadata.")
+                if resource.status_code != 200 or metadata.status_code != 200:
+                    raise RuntimeError("Public OAuth discovery metadata was unavailable.")
+                if hidden_ui.status_code != 404 or hidden_api.status_code != 404:
+                    raise RuntimeError("OAuth exposure made the local UI or API public.")
+
+                async with oauth_mcp_client(public.public_mcp_url, password=password) as (
+                    client,
+                    token_storage,
+                ):
+                    tools = await client.list_tools()
+                    if not any(tool.name == "gateway_status" for tool in tools.tools):
+                        raise RuntimeError("OAuth MCP did not expose gateway_status.")
+                    status = await client.call_tool("gateway_status")
+                    safe_results: list[object] = [_tool_payload(status)]
+                    if include_scopus:
+                        safe_results.extend(await _remote_scopus_flow(client))
+                    _assert_secret_absent(runtime_settings, safe_results, temporary.database.path)
+                    tokens = token_storage.tokens
+                    if not tokens or not tokens.refresh_token:
+                        raise RuntimeError("OAuth flow did not issue access and refresh tokens.")
+                    store_bytes = runtime_settings.mcp_oauth.store_path.read_bytes()
+                    if (
+                        tokens.access_token.encode() in store_bytes
+                        or tokens.refresh_token.encode() in store_bytes
+                    ):
+                        raise RuntimeError("Raw OAuth tokens leaked into the OAuth state store.")
+                if include_scopus:
+                    print("OAUTH SCOPUS NGROK ACCEPTANCE: PASS")
+                else:
+                    print("OAUTH NGROK MCP ACCEPTANCE: PASS")
+        finally:
+            await tunnel.astop()
+
+
 async def _remote_scopus_flow(client: Client) -> list[object]:
     count = await client.call_tool("scopus_count", {"provider_query": SCOPUS_ACCEPTANCE_QUERY})
     sample = await client.call_tool(
@@ -325,19 +423,36 @@ async def _remote_scopus_flow(client: Client) -> list[object]:
             "max_records": 3,
         },
     )
+    saved_payload = _tool_payload(saved)
     run = await client.call_tool(
-        "search_run_get", {"search_run_id": saved.structured_content["search_run_id"]}
+        "search_run_get", {"search_run_id": saved_payload["search_run_id"]}
     )
     evidence = await client.call_tool("evidence_search", {"study_id": "remote-scopus", "limit": 10})
-    if count.is_error or sample.is_error or saved.is_error or not run.structured_content["hits"]:
+    count_payload = _tool_payload(count)
+    sample_payload = _tool_payload(sample)
+    run_payload = _tool_payload(run)
+    evidence_payload = _tool_payload(evidence)
+    if count.is_error or sample.is_error or saved.is_error or not run_payload["hits"]:
         raise RuntimeError("Remote Scopus MCP flow did not complete.")
     return [
-        count.structured_content,
-        sample.structured_content,
-        saved.structured_content,
-        run.structured_content,
-        evidence.structured_content,
+        count_payload,
+        sample_payload,
+        saved_payload,
+        run_payload,
+        evidence_payload,
     ]
+
+
+def _tool_payload(result: object) -> dict[str, object]:
+    structured = getattr(result, "structured_content", None)
+    if isinstance(structured, dict):
+        return structured
+    content = getattr(result, "content", None) or []
+    if content and isinstance(getattr(content[0], "text", None), str):
+        payload = json.loads(content[0].text)
+        if isinstance(payload, dict):
+            return payload
+    raise RuntimeError("MCP tool did not return an object result.")
 
 
 @asynccontextmanager
