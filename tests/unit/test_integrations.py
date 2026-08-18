@@ -2,18 +2,27 @@ from __future__ import annotations
 
 import base64
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
+from mcp.client import Client
 
 from research_gateway.config import GithubSettings, ZoteroSettings
 from research_gateway.db.database import EvidenceDatabase
 from research_gateway.domain.models import SourceRecord
 from research_gateway.integrations.github import GithubAdapter
 from research_gateway.integrations.zotero import ZoteroAdapter
+from research_gateway.mcp.server import create_mcp_server
 
 
-async def _database_with_final_evidence(tmp_path: Path) -> tuple[EvidenceDatabase, str]:
+async def _database_with_final_evidence(
+    tmp_path: Path,
+    *,
+    provider: str = "fixture",
+    publication_type: str | None = None,
+    publication: str | None = None,
+) -> tuple[EvidenceDatabase, str]:
     database = EvidenceDatabase(tmp_path / "evidence.db")
     await database.migrate()
     await database.create_study("s1", "Study", "Purpose")
@@ -33,12 +42,15 @@ async def _database_with_final_evidence(tmp_path: Path) -> tuple[EvidenceDatabas
         run.search_run_id,
         1,
         SourceRecord(
-            provider="fixture",
+            provider=provider,
             provider_record_id="r1",
             title="A useful final paper",
             authors=[{"name": "Grace Hopper"}],
             year=2024,
             doi="10.1000/final",
+            publication=publication,
+            publication_type=publication_type,
+            review_status="preprint" if publication_type == "preprint" else "unknown",
         ),
     )
     await database.set_screening(result.evidence_id, "final", reason=None, note=None, actor="test")
@@ -98,10 +110,150 @@ async def test_zotero_write_is_idempotent_from_durable_link(tmp_path: Path) -> N
     first = await adapter.sync_final_corpus(study_id="s1", dry_run=False)
     second = await adapter.sync_final_corpus(study_id="s1", dry_run=False)
     assert first["created"] == 1
+    assert first["created_items"] == [
+        {
+            "evidence_id": evidence_id,
+            "item_key": "ITEM1",
+            "title": "A useful final paper",
+        }
+    ]
     assert second["created"] == 0
+    assert second["created_items"] == []
     assert second["already_linked"] == 1
     assert calls == 2
     assert await database.get_zotero_link(evidence_id, "user", "42")
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_zotero_root_library_creates_valid_preprint_and_persists_key(
+    tmp_path: Path,
+) -> None:
+    database, evidence_id = await _database_with_final_evidence(
+        tmp_path,
+        provider="arxiv",
+        publication_type="preprint",
+        publication="arXiv",
+    )
+    created_payloads: list[dict[str, object]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=[])
+        payload = __import__("json").loads(request.content)
+        item = payload[0]
+        created_payloads.append(item)
+        assert item["itemType"] == "preprint"
+        assert item["repository"] == "arXiv"
+        assert "publicationTitle" not in item
+        assert "collections" not in item
+        return httpx.Response(200, json={"success": {"0": "ROOTITEM"}, "failed": {}})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = ZoteroAdapter(
+        ZoteroSettings(
+            enabled=True,
+            api_key="zotero-secret",
+            library_id="42",
+            collection_key="",
+            collection_name="",
+        ),
+        database,
+        client=client,
+    )
+
+    first = await adapter.sync_final_corpus(study_id="s1", dry_run=False)
+    second = await adapter.sync_final_corpus(study_id="s1", dry_run=False)
+
+    assert first["created"] == 1
+    assert first["created_items"][0]["item_key"] == "ROOTITEM"
+    assert second["created"] == 0
+    assert second["already_linked"] == 1
+    assert len(created_payloads) == 1
+    link = await database.get_zotero_link(evidence_id, "user", "42")
+    assert link and link["item_key"] == "ROOTITEM"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_zotero_bulk_item_failure_is_safe_and_audited(tmp_path: Path) -> None:
+    database, _ = await _database_with_final_evidence(tmp_path)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json=[])
+        return httpx.Response(
+            200,
+            json={
+                "successful": {},
+                "failed": {
+                    "0": {
+                        "code": 400,
+                        "message": "publicationTitle is not a valid field for preprint",
+                    }
+                },
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = ZoteroAdapter(
+        ZoteroSettings(enabled=True, api_key="zotero-secret", library_id="42"),
+        database,
+        client=client,
+    )
+
+    runtime = SimpleNamespace(zotero=adapter)
+    async with Client(create_mcp_server(runtime)) as mcp:
+        result = await mcp.call_tool("zotero_sync_corpus", {"study_id": "s1", "dry_run": False})
+
+    assert result.is_error
+    error_text = " ".join(str(item) for item in result.content)
+    assert "HTTP 400" in error_text
+    assert "category=validation_error" in error_text
+    assert "operation=create_bibliographic_items" in error_text
+    assert "stage=item_creation" in error_text
+
+    events = await database.list_audit_events()
+    assert events[0]["status"] == "failed"
+    assert events[0]["error_type"] == "zotero_write_error"
+    assert "operation=create_bibliographic_items" in events[0]["safe_summary"]
+    assert "zotero-secret" not in events[0]["safe_summary"]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_zotero_credential_status_reports_permissions_without_key(tmp_path: Path) -> None:
+    database = EvidenceDatabase(tmp_path / "evidence.db")
+    await database.migrate()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/keys/current"
+        assert request.headers["Zotero-API-Key"] == "zotero-secret"
+        return httpx.Response(
+            200,
+            json={
+                "userID": 42,
+                "access": {"user": {"library": True, "write": True, "notes": False}},
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = ZoteroAdapter(
+        ZoteroSettings(enabled=True, api_key="zotero-secret", library_id="42"),
+        database,
+        client=client,
+    )
+
+    status = await adapter.credential_status()
+
+    assert status == {
+        "library_type": "user",
+        "library_id": "42",
+        "library_read": True,
+        "library_write": True,
+        "notes": False,
+    }
+    assert "zotero-secret" not in repr(status)
     await client.aclose()
 
 
@@ -280,8 +432,11 @@ async def test_zotero_reads_and_creates_named_collection(tmp_path: Path) -> None
         database,
         client=client,
     )
-    assert (await adapter.search_items("Paper"))["items"][0]["key"] == "I1"
-    assert (await adapter.get_item("I1"))["title"] == "Paper"
+    searched = (await adapter.search_items("Paper"))["items"][0]
+    assert searched["item_key"] == "I1"
+    fetched = await adapter.get_item(searched["item_key"])
+    assert fetched["item_key"] == searched["item_key"]
+    assert fetched["title"] == searched["title"] == "Paper"
     assert (await adapter.list_collections())["collections"] == []
     synced = await adapter.sync_final_corpus(study_id="s1", dry_run=False)
     assert synced["created"] == 1

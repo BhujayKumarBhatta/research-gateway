@@ -20,3 +20,18 @@ Publication type and review status are separate fields. “Preprint” means the
 shared before a journal or conference review decision, such as an arXiv record.
 “Peer reviewed” is assigned only when provider metadata identifies a journal article,
 review, or conference paper. Ambiguous records remain `unknown`.
+
+## Zotero read and write checks
+
+`zotero_search` returns the Zotero `item_key` with each bibliographic result. Pass that
+same key to `zotero_get_item` to read the exact item. `zotero_credential_status` reads
+Zotero's current-key metadata and reports effective library read, write, and note
+permissions without returning the API key.
+
+Final-corpus synchronization does not require a collection. When both collection
+settings are empty, Research Gateway writes the bibliographic item to the library
+root and stores the returned item key beside the local evidence record. A repeated
+sync sees that durable link and does not create a duplicate. Zotero can return HTTP
+200 for a batch in which an individual item failed; Research Gateway checks every
+item result and records such a write as failed with a safe status, category,
+operation, and stage.

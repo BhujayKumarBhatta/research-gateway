@@ -85,7 +85,11 @@ contains `data/research_gateway.db`, rotating logs, Excel backups, and process s
 - ACM Digital Library remains honestly unavailable because an official supported search API has not been verified. Crossref or OpenAlex is not presented as ACM search.
 - Zotero checks the remote library by DOI, then by normalized title and year, before
   creating anything. It links a matching item back to Evidence, defaults to dry-run,
-  skips durable existing links, and never deletes or uploads PDFs.
+  skips durable existing links, and never deletes or uploads PDFs. A collection is
+  optional: with no collection configured, new items are written to the personal
+  library root. Search results include `item_key`, so the exact result can be passed
+  to `zotero_get_item`. Zotero's per-item write failures are returned and audited as
+  failures instead of being reported as a successful zero-item sync.
 - GitHub supports bounded reads and branch-to-commit-to-pull-request proposals. It defaults to dry-run and never force-pushes, deletes, merges, changes settings, or writes directly to the default branch.
 
 The Sources page and `source_list` MCP tool show actual availability, capabilities, paging notes, and retention policy without displaying credentials.

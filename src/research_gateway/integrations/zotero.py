@@ -6,7 +6,30 @@ import httpx
 
 from research_gateway.config import ZoteroSettings
 from research_gateway.db.database import EvidenceDatabase, normalize_doi, normalize_text
-from research_gateway.sources.base import ProviderConfigurationError, safe_http_error
+from research_gateway.sources.base import (
+    ProviderConfigurationError,
+    ProviderError,
+    ProviderPayloadError,
+    safe_http_error,
+)
+
+
+class ZoteroWriteError(ProviderError):
+    """Safe failure from a Zotero collection or bibliographic-item write."""
+
+    error_type = "zotero_write_error"
+
+    def __init__(self, *, status_code: int, operation: str, stage: str) -> None:
+        category = _write_error_category(status_code)
+        super().__init__(
+            "Zotero write failed: "
+            f"HTTP {status_code}; category={category}; "
+            f"operation={operation}; stage={stage}.",
+            status_code=status_code,
+        )
+        self.category = category
+        self.operation = operation
+        self.stage = stage
 
 
 class ZoteroAdapter:
@@ -31,7 +54,7 @@ class ZoteroAdapter:
             "enabled": self.settings.enabled,
             "configured": self.settings.configured,
             "available": self.settings.enabled and self.settings.configured,
-            "read_capabilities": ["library_items", "collections"],
+            "read_capabilities": ["library_items", "collections", "credential_permissions"],
             "write_capabilities": ["create_collection", "create_bibliographic_items"],
             "safety": ["dry_run_default", "no_delete", "no_pdf_upload"],
         }
@@ -61,11 +84,80 @@ class ZoteroAdapter:
             ]
         }
 
+    async def credential_status(self) -> dict[str, Any]:
+        """Return effective permissions for the configured library without exposing the key."""
+        payload = await self._request("GET", "/keys/current", library_scoped=False)
+        if not isinstance(payload, dict):
+            raise ProviderPayloadError("Zotero returned malformed credential metadata.")
+        access = payload.get("access") or {}
+        if not isinstance(access, dict):
+            raise ProviderPayloadError("Zotero returned malformed credential metadata.")
+        if self.settings.library_type == "user":
+            permissions = access.get("user") or {}
+        else:
+            groups = access.get("groups") or {}
+            permissions = (
+                groups.get(self.settings.library_id) or groups.get("all") or {}
+                if isinstance(groups, dict)
+                else {}
+            )
+        if not isinstance(permissions, dict):
+            permissions = {}
+        return {
+            "library_type": self.settings.library_type,
+            "library_id": self.settings.library_id,
+            "library_read": bool(permissions.get("library")),
+            "library_write": bool(permissions.get("write")),
+            "notes": bool(permissions.get("notes")),
+        }
+
     async def sync_final_corpus(
         self,
         *,
         study_id: str | None = None,
         dry_run: bool = True,
+    ) -> dict[str, Any]:
+        try:
+            result = await self._sync_final_corpus(study_id=study_id, dry_run=dry_run)
+        except Exception as error:
+            if not dry_run:
+                safe_summary = (
+                    error.safe_message
+                    if isinstance(error, ProviderError)
+                    else "Zotero sync failed during local processing."
+                )
+                await self.database.audit(
+                    "zotero.sync_final_corpus",
+                    status="failed",
+                    study_id=study_id,
+                    source="zotero",
+                    safe_summary=safe_summary,
+                    error_type=(
+                        error.error_type
+                        if isinstance(error, ProviderError)
+                        else type(error).__name__
+                    ),
+                )
+            raise
+        if not dry_run:
+            await self.database.audit(
+                "zotero.sync_final_corpus",
+                status="completed",
+                study_id=study_id,
+                source="zotero",
+                safe_summary=(
+                    f"Created {result['created']} bibliographic items; "
+                    f"matched {result['matched_existing']}; "
+                    f"skipped {result['already_linked']} linked items."
+                ),
+            )
+        return result
+
+    async def _sync_final_corpus(
+        self,
+        *,
+        study_id: str | None,
+        dry_run: bool,
     ) -> dict[str, Any]:
         if not self.settings.configured:
             raise ProviderConfigurationError(
@@ -119,6 +211,8 @@ class ZoteroAdapter:
                     f"/items/{item_key}",
                     headers={"If-Unmodified-Since-Version": str(item.get("version") or 0)},
                     json={"collections": [*collections, collection_key]},
+                    operation="update_bibliographic_item",
+                    stage="item_update",
                 )
                 updated_existing += 1
             await self.database.save_zotero_link(
@@ -135,32 +229,49 @@ class ZoteroAdapter:
                 "matched_existing": matched_existing,
                 "updated_existing": updated_existing,
                 "already_linked": linked,
+                "created_items": [],
                 "deleted": 0,
                 "files_uploaded": 0,
             }
-        payload = await self._request("POST", "/items", json=[item for _, item in create_items])
-        successful = payload.get("successful") or {}
-        created = 0
+        payload = await self._request(
+            "POST",
+            "/items",
+            json=[item for _, item in create_items],
+            operation="create_bibliographic_items",
+            stage="item_creation",
+        )
+        successful = _successful_results(payload)
+        created_items = []
+        missing_indexes = []
         for index, (evidence, _) in enumerate(create_items):
-            item = successful.get(str(index))
-            if not isinstance(item, dict) or not item.get("key"):
+            item_key = _created_key(successful.get(str(index)))
+            if not item_key:
+                missing_indexes.append(str(index))
                 continue
             await self.database.save_zotero_link(
                 evidence["evidence_id"],
                 self.settings.library_type,
                 self.settings.library_id,
-                str(item["key"]),
+                item_key,
             )
-            created += 1
-        await self.database.audit(
-            "zotero.sync_final_corpus",
-            status="completed",
-            source="zotero",
-            safe_summary=f"Created {created} bibliographic items; skipped {linked} linked items.",
-        )
+            created_items.append(
+                {
+                    "evidence_id": evidence["evidence_id"],
+                    "item_key": item_key,
+                    "title": evidence.get("title") or "Untitled",
+                }
+            )
+        if missing_indexes:
+            raise _bulk_write_error(
+                payload,
+                indexes=missing_indexes,
+                operation="create_bibliographic_items",
+                stage="item_creation",
+            )
         return {
             "dry_run": False,
-            "created": created,
+            "created": len(created_items),
+            "created_items": created_items,
             "matched_existing": matched_existing,
             "updated_existing": updated_existing,
             "already_linked": linked,
@@ -177,13 +288,21 @@ class ZoteroAdapter:
 
     async def _create_collection(self, name: str) -> str:
         payload = await self._request(
-            "POST", "/collections", json=[{"name": name, "parentCollection": False}]
+            "POST",
+            "/collections",
+            json=[{"name": name, "parentCollection": False}],
+            operation="create_collection",
+            stage="collection_creation",
         )
-        successful = payload.get("successful") or {}
-        created = successful.get("0")
-        if not isinstance(created, dict) or not created.get("key"):
-            raise RuntimeError("Zotero did not return a key for the created collection.")
-        return str(created["key"])
+        item_key = _created_key(_successful_results(payload).get("0"))
+        if not item_key:
+            raise _bulk_write_error(
+                payload,
+                indexes=["0"],
+                operation="create_collection",
+                stage="collection_creation",
+            )
+        return item_key
 
     async def _find_existing_item(self, evidence: dict[str, Any]) -> dict[str, Any] | None:
         doi = normalize_doi(evidence.get("normalized_doi") or evidence.get("doi"))
@@ -211,16 +330,26 @@ class ZoteroAdapter:
                 return item
         return None
 
-    async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        library_scoped: bool = True,
+        operation: str | None = None,
+        stage: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
         if not self.settings.configured:
             raise ProviderConfigurationError(
                 "Zotero credentials and library ID are not configured."
             )
         library = f"{self.settings.library_type}s/{self.settings.library_id}"
+        target = f"/{library}{path}" if library_scoped else path
         extra_headers = kwargs.pop("headers", {})
         response = await self.client.request(
             method,
-            f"{self.settings.base_url.rstrip('/')}/{library}{path}",
+            f"{self.settings.base_url.rstrip('/')}{target}",
             headers={
                 "Zotero-API-Key": self.settings.api_key.get_secret_value(),
                 "Zotero-API-Version": "3",
@@ -229,6 +358,12 @@ class ZoteroAdapter:
             **kwargs,
         )
         if not 200 <= response.status_code < 300:
+            if operation and stage:
+                raise ZoteroWriteError(
+                    status_code=response.status_code,
+                    operation=operation,
+                    stage=stage,
+                )
             raise safe_http_error("zotero", response.status_code)
         return response.json() if response.content else {}
 
@@ -261,9 +396,7 @@ def _zotero_item(evidence: dict[str, Any], collection_key: str) -> dict[str, Any
         "title": evidence.get("title") or "Untitled",
         "creators": creators,
         "abstractNote": evidence.get("abstract") or "",
-        "publicationTitle": evidence.get("publication") or "",
         "date": evidence.get("publication_date") or str(evidence.get("year") or ""),
-        "DOI": evidence.get("normalized_doi") or evidence.get("doi") or "",
         "url": evidence.get("url") or "",
         "tags": [{"tag": tag} for tag in dict.fromkeys(tags)],
         "extra": (
@@ -272,6 +405,19 @@ def _zotero_item(evidence: dict[str, Any], collection_key: str) -> dict[str, Any
             f"Review status: {evidence.get('review_status') or 'unknown'}"
         ),
     }
+    publication = evidence.get("publication") or ""
+    source_field = {
+        "journalArticle": "publicationTitle",
+        "conferencePaper": "proceedingsTitle",
+        "bookSection": "bookTitle",
+        "book": "publisher",
+        "preprint": "repository",
+    }[item_type]
+    if publication:
+        item[source_field] = publication
+    doi = evidence.get("normalized_doi") or evidence.get("doi") or ""
+    if doi and item_type != "book":
+        item["DOI"] = doi
     if collection_key:
         item["collections"] = [collection_key]
     return item
@@ -279,8 +425,10 @@ def _zotero_item(evidence: dict[str, Any], collection_key: str) -> dict[str, Any
 
 def _compact_item(item: dict[str, Any]) -> dict[str, Any]:
     data = item.get("data") or {}
+    item_key = item.get("key") or data.get("key")
     return {
-        "key": item.get("key"),
+        "item_key": item_key,
+        "key": item_key,
         "version": item.get("version"),
         "itemType": data.get("itemType"),
         "title": data.get("title"),
@@ -290,3 +438,59 @@ def _compact_item(item: dict[str, Any]) -> dict[str, Any]:
         "creators": data.get("creators") or [],
         "collections": data.get("collections") or [],
     }
+
+
+def _successful_results(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    results = payload.get("successful") or payload.get("success") or {}
+    return results if isinstance(results, dict) else {}
+
+
+def _created_key(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if not isinstance(value, dict):
+        return ""
+    data = value.get("data") or {}
+    key = value.get("key") or (data.get("key") if isinstance(data, dict) else None)
+    return str(key or "")
+
+
+def _bulk_write_error(
+    payload: Any,
+    *,
+    indexes: list[str],
+    operation: str,
+    stage: str,
+) -> ZoteroWriteError:
+    failed = payload.get("failed") if isinstance(payload, dict) else None
+    status_code = 502
+    if isinstance(failed, dict):
+        for index in indexes:
+            detail = failed.get(index)
+            if isinstance(detail, dict):
+                try:
+                    status_code = int(detail.get("code") or 400)
+                except (TypeError, ValueError):
+                    status_code = 400
+                break
+    return ZoteroWriteError(status_code=status_code, operation=operation, stage=stage)
+
+
+def _write_error_category(status_code: int) -> str:
+    if status_code in {401, 403}:
+        return "permission_error"
+    if status_code == 400:
+        return "validation_error"
+    if status_code == 409:
+        return "library_locked"
+    if status_code == 412:
+        return "version_conflict"
+    if status_code == 413:
+        return "payload_too_large"
+    if status_code == 429:
+        return "rate_limit_error"
+    if status_code >= 500:
+        return "upstream_error"
+    return "provider_error"
