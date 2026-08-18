@@ -143,6 +143,79 @@ class OAuthStore:
         payload["_family_id"] = row["family_id"]
         return payload
 
+    def complete_approval(
+        self,
+        approval_digest: str,
+        *,
+        code_digest: str,
+        code_payload: dict[str, Any],
+        code_expires_at: float,
+        completion_payload: dict[str, Any],
+        completion_expires_at: float,
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Atomically consume one approval or return its active completed result."""
+        now = time.time()
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            approval = connection.execute(
+                """
+                SELECT digest FROM oauth_records
+                WHERE kind = 'approval' AND digest = ? AND used_at IS NULL
+                  AND revoked_at IS NULL AND expires_at >= ?
+                """,
+                (approval_digest, now),
+            ).fetchone()
+            if approval:
+                updated = connection.execute(
+                    """
+                    UPDATE oauth_records SET used_at = ?
+                    WHERE kind = 'approval' AND digest = ? AND used_at IS NULL
+                      AND revoked_at IS NULL
+                    """,
+                    (now, approval_digest),
+                )
+                if updated.rowcount != 1:
+                    return None
+                connection.execute(
+                    """
+                    INSERT INTO oauth_records(
+                        kind, digest, payload_json, expires_at, created_at
+                    ) VALUES ('code', ?, ?, ?, ?)
+                    """,
+                    (
+                        code_digest,
+                        json.dumps(code_payload, separators=(",", ":")),
+                        code_expires_at,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO oauth_records(
+                        kind, digest, payload_json, expires_at, created_at
+                    ) VALUES ('approval_complete', ?, ?, ?, ?)
+                    """,
+                    (
+                        approval_digest,
+                        json.dumps(completion_payload, separators=(",", ":")),
+                        completion_expires_at,
+                        now,
+                    ),
+                )
+                return "created", completion_payload
+
+            completed = connection.execute(
+                """
+                SELECT payload_json FROM oauth_records
+                WHERE kind = 'approval_complete' AND digest = ?
+                  AND used_at IS NULL AND revoked_at IS NULL AND expires_at >= ?
+                """,
+                (approval_digest, now),
+            ).fetchone()
+            if completed:
+                return "duplicate", json.loads(completed["payload_json"])
+        return None
+
     def revoke_family(self, family_id: str) -> None:
         with self._lock, self._connect() as connection:
             connection.execute(

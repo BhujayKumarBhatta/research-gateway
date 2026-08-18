@@ -98,6 +98,7 @@ class McpOAuthSettings(BaseModel):
     refresh_token_days: int = Field(default=30, ge=1, le=365)
     authorization_code_seconds: int = Field(default=300, ge=60, le=600)
     approval_request_seconds: int = Field(default=600, ge=60, le=1800)
+    approval_completion_seconds: int = Field(default=90, ge=60, le=120)
 
     @field_validator("store_path")
     @classmethod

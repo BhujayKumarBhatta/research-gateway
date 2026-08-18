@@ -34,6 +34,7 @@ sealing_secret = ""
 # store_path = "~/.research-gateway/data/runtime/oauth.sqlite3"
 access_token_minutes = 60
 refresh_token_days = 30
+approval_completion_seconds = 90
 
 [tunnel]
 enabled = true

@@ -21,6 +21,7 @@ from research_gateway.api.app import create_app
 from research_gateway.config import Settings
 from research_gateway.db.database import EvidenceDatabase
 from research_gateway.oauth.client import oauth_mcp_client
+from research_gateway.oauth.provider import validated_redirect_origin
 from research_gateway.oauth.security import hash_password, keyed_digest
 from research_gateway.operations.backups import ExcelBackupService
 from research_gateway.operations.logging import configure_logging
@@ -28,6 +29,7 @@ from research_gateway.runtime import GatewayRuntime
 from research_gateway.sources.scopus import ScopusAdapter
 
 PASSWORD = "correct horse battery staple"
+CHATGPT_REDIRECT = "https://chatgpt.com/connector/oauth/callback"
 VERIFIER = "v" * 64
 CHALLENGE = (
     base64.urlsafe_b64encode(hashlib.sha256(VERIFIER.encode()).digest()).decode().rstrip("=")
@@ -62,18 +64,23 @@ def _settings(tmp_path: Path, *, access_token_minutes: int = 60) -> Settings:
     )
 
 
-def _register(client: TestClient) -> dict[str, object]:
+def _register(
+    client: TestClient,
+    *,
+    redirect_uri: str = CHATGPT_REDIRECT,
+    application_type: str = "web",
+) -> dict[str, object]:
     response = client.post(
         "/register",
         headers=REMOTE,
         json={
             "client_name": "ChatGPT",
-            "redirect_uris": ["https://chatgpt.com/connector/oauth/callback"],
+            "redirect_uris": [redirect_uri],
             "grant_types": ["authorization_code", "refresh_token"],
             "response_types": ["code"],
             "scope": "research-gateway",
             "token_endpoint_auth_method": "none",
-            "application_type": "web",
+            "application_type": application_type,
         },
     )
     assert response.status_code == 201, response.text
@@ -83,7 +90,7 @@ def _register(client: TestClient) -> dict[str, object]:
 def _begin_authorization(client: TestClient, client_id: str, **overrides: str):
     params = {
         "client_id": client_id,
-        "redirect_uri": "https://chatgpt.com/connector/oauth/callback",
+        "redirect_uri": CHATGPT_REDIRECT,
         "response_type": "code",
         "code_challenge": CHALLENGE,
         "code_challenge_method": "S256",
@@ -128,9 +135,7 @@ def _authorize(client: TestClient, client_id: str) -> str:
     )
     assert approved.status_code == 302
     callback = urlparse(approved.headers["location"])
-    assert f"{callback.scheme}://{callback.netloc}{callback.path}" == (
-        "https://chatgpt.com/connector/oauth/callback"
-    )
+    assert f"{callback.scheme}://{callback.netloc}{callback.path}" == (CHATGPT_REDIRECT)
     values = parse_qs(callback.query)
     assert values["state"] == ["chatgpt-state"]
     return values["code"][0]
@@ -145,7 +150,7 @@ def _token(client: TestClient, client_id: str, code: str, verifier: str = VERIFI
             "client_id": client_id,
             "code": code,
             "code_verifier": verifier,
-            "redirect_uri": "https://chatgpt.com/connector/oauth/callback",
+            "redirect_uri": CHATGPT_REDIRECT,
             "resource": "https://gateway.example/mcp",
         },
     )
@@ -284,6 +289,102 @@ def test_oauth_discovery_login_pkce_token_mcp_and_rotation(tmp_path: Path) -> No
     assert tokens["refresh_token"].encode() not in evidence_bytes
 
 
+@pytest.mark.parametrize(
+    ("redirect_uri", "expected_origin", "application_type"),
+    (
+        (
+            "https://callbacks.example:8443/connector/oauth/callback?tenant=research",
+            "https://callbacks.example:8443",
+            "web",
+        ),
+        (
+            "http://127.0.0.1:54321/oauth/callback?client=desktop",
+            "http://127.0.0.1:54321",
+            "native",
+        ),
+    ),
+)
+def test_approval_csp_allows_only_the_exact_registered_callback_origin(
+    tmp_path: Path,
+    redirect_uri: str,
+    expected_origin: str,
+    application_type: str,
+) -> None:
+    with TestClient(create_app(_settings(tmp_path)), base_url="https://gateway.example") as client:
+        registration = _register(
+            client,
+            redirect_uri=redirect_uri,
+            application_type=application_type,
+        )
+        client_id = str(registration["client_id"])
+        start = _begin_authorization(client, client_id, redirect_uri=redirect_uri)
+        assert start.status_code == 302
+        login = client.get(start.headers["location"], headers=REMOTE)
+        assert login.status_code == 200
+
+        policy = login.headers["content-security-policy"]
+        assert "default-src 'none'" in policy
+        assert "style-src 'unsafe-inline'" in policy
+        assert f"form-action 'self' {expected_origin};" in policy
+        assert "base-uri 'none'" in policy
+        assert "frame-ancestors 'none'" in policy
+        assert "attacker.example" not in policy
+        assert urlparse(redirect_uri).path not in policy
+        assert urlparse(redirect_uri).query not in policy
+
+        request_id, csrf = _approval_fields(login.text)
+        approved = client.post(
+            "/oauth/authorize",
+            headers=REMOTE,
+            data={
+                "request": request_id,
+                "csrf": csrf,
+                "password": PASSWORD,
+                "decision": "allow",
+            },
+            follow_redirects=False,
+        )
+        assert approved.status_code == 302
+        assert (
+            f"form-action 'self' {expected_origin};" in approved.headers["content-security-policy"]
+        )
+
+
+@pytest.mark.parametrize(
+    "redirect_uri",
+    (
+        "https://user@example.test/oauth/callback",
+        "http://attacker.example/oauth/callback",
+        "javascript:alert(1)",
+        "https://example.test:99999/oauth/callback",
+        "https://example.test';form-action https://attacker.example/oauth/callback",
+        "https://[::1/oauth/callback",
+    ),
+)
+def test_malformed_redirect_cannot_produce_a_csp_source(redirect_uri: str) -> None:
+    with pytest.raises(ValueError):
+        validated_redirect_origin(redirect_uri)
+
+
+def test_unregistered_redirect_cannot_influence_approval_csp(tmp_path: Path) -> None:
+    with TestClient(create_app(_settings(tmp_path)), base_url="https://gateway.example") as client:
+        registration = _register(client)
+        client_id = str(registration["client_id"])
+        rejected = _begin_authorization(
+            client,
+            client_id,
+            redirect_uri="https://attacker.example/oauth/callback",
+        )
+        assert rejected.status_code == 400
+
+        start = _begin_authorization(client, client_id)
+        login = client.get(start.headers["location"], headers=REMOTE)
+        assert login.status_code == 200
+        policy = login.headers["content-security-policy"]
+        assert f"form-action 'self' {validated_redirect_origin(CHATGPT_REDIRECT)};" in policy
+        assert "attacker.example" not in policy
+
+
 def test_oauth_rejects_bad_redirect_resource_state_and_reused_approval(tmp_path: Path) -> None:
     with TestClient(create_app(_settings(tmp_path)), base_url="https://gateway.example") as client:
         registration = _register(client)
@@ -318,8 +419,113 @@ def test_oauth_rejects_bad_redirect_resource_state_and_reused_approval(tmp_path:
             "/oauth/authorize",
             headers=REMOTE,
             data={"request": request_id, "csrf": csrf, "password": PASSWORD, "decision": "allow"},
+            follow_redirects=False,
         )
-        assert replay.status_code == 400
+        assert replay.status_code == 302
+        assert replay.headers["location"] == approved.headers["location"]
+
+
+def test_duplicate_approval_reuses_one_code_until_completion_expires(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with TestClient(create_app(settings), base_url="https://gateway.example") as client:
+        registration = _register(client)
+        client_id = str(registration["client_id"])
+        start = _begin_authorization(client, client_id)
+        login = client.get(start.headers["location"], headers=REMOTE)
+        request_id, csrf = _approval_fields(login.text)
+        approval = {
+            "request": request_id,
+            "csrf": csrf,
+            "password": PASSWORD,
+            "decision": "allow",
+        }
+
+        first = client.post(
+            "/oauth/authorize", headers=REMOTE, data=approval, follow_redirects=False
+        )
+        duplicate = client.post(
+            "/oauth/authorize", headers=REMOTE, data=approval, follow_redirects=False
+        )
+
+        assert first.status_code == 302
+        assert duplicate.status_code == 302
+        assert duplicate.headers["location"] == first.headers["location"]
+        values = parse_qs(urlparse(first.headers["location"]).query)
+        code = values["code"][0]
+        with sqlite3.connect(settings.mcp_oauth.store_path) as connection:
+            assert (
+                connection.execute(
+                    "SELECT COUNT(*) FROM oauth_records WHERE kind = 'code'"
+                ).fetchone()[0]
+                == 1
+            )
+            assert (
+                connection.execute(
+                    "SELECT COUNT(*) FROM oauth_records WHERE kind = 'approval_complete'"
+                ).fetchone()[0]
+                == 1
+            )
+
+        assert _token(client, client_id, code).status_code == 200
+        assert _token(client, client_id, code).status_code == 400
+
+        with sqlite3.connect(settings.mcp_oauth.store_path) as connection:
+            connection.execute(
+                "UPDATE oauth_records SET expires_at = 0 WHERE kind = 'approval_complete'"
+            )
+        expired_duplicate = client.post(
+            "/oauth/authorize", headers=REMOTE, data=approval, follow_redirects=False
+        )
+        assert expired_duplicate.status_code == 400
+
+
+def test_oauth_lifecycle_logging_uses_only_safe_correlation_ids(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    settings = _settings(tmp_path)
+    caplog.set_level(logging.INFO, logger="research_gateway.oauth")
+    with TestClient(create_app(settings), base_url="https://gateway.example") as client:
+        registration = _register(client)
+        client_id = str(registration["client_id"])
+        start = _begin_authorization(client, client_id)
+        login = client.get(start.headers["location"], headers=REMOTE)
+        request_id, csrf = _approval_fields(login.text)
+        approved = client.post(
+            "/oauth/authorize",
+            headers=REMOTE,
+            data={"request": request_id, "csrf": csrf, "password": PASSWORD, "decision": "allow"},
+            follow_redirects=False,
+        )
+        duplicate = client.post(
+            "/oauth/authorize",
+            headers=REMOTE,
+            data={"request": request_id, "csrf": csrf, "password": PASSWORD, "decision": "allow"},
+            follow_redirects=False,
+        )
+        code = parse_qs(urlparse(approved.headers["location"]).query)["code"][0]
+        assert _token(client, client_id, code).status_code == 200
+        assert duplicate.headers["location"] == approved.headers["location"]
+
+    oauth_log = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.name.startswith("research_gateway.oauth")
+    )
+    for event in (
+        "oauth authorize request created",
+        "oauth approval page served",
+        "oauth approval submitted",
+        "oauth approval accepted",
+        "oauth approval duplicate/replay detected",
+        "oauth callback redirect issued",
+        "oauth token exchanged",
+    ):
+        assert event in oauth_log
+    assert re.search(r"oauth_flow=[0-9a-f]{12}", oauth_log)
+    for secret in (request_id, csrf, PASSWORD, code):
+        assert secret not in oauth_log
 
 
 def test_expired_authorization_code_and_access_token_are_rejected(tmp_path: Path) -> None:

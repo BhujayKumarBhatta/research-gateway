@@ -24,7 +24,7 @@ from research_gateway.mcp.server import create_mcp_server
 from research_gateway.oauth.setup import initialize_oauth, with_oauth_urls
 from research_gateway.operations.backups import ExcelBackupService
 from research_gateway.operations.logging import configure_logging
-from research_gateway.operations.service import ServiceManager
+from research_gateway.operations.service import ServiceManager, ServiceStartError
 from research_gateway.operations.storage import relocate_storage
 from research_gateway.runtime import GatewayRuntime
 from research_gateway.tunnel import NgrokTunnel
@@ -261,8 +261,16 @@ def service_start(
 ) -> None:
     """Start Research Gateway in the background and wait for local health."""
     selected = (config or resolve_config_path()).expanduser().absolute()
-    result = ServiceManager(_load(selected), selected).start(tunnel=tunnel)
+    try:
+        result = ServiceManager(_load(selected), selected).start(tunnel=tunnel)
+    except ServiceStartError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(2) from None
+    if result.get("running") and not result.get("started"):
+        typer.echo("Research Gateway is already running.")
     _print_service_status(result)
+    if result.get("running") and not result.get("started"):
+        typer.echo("Service start: no action required.")
 
 
 @service_app.command("stop")
@@ -282,7 +290,11 @@ def service_restart(
 ) -> None:
     """Stop and start the background service with the selected tunnel mode."""
     selected = (config or resolve_config_path()).expanduser().absolute()
-    result = ServiceManager(_load(selected), selected).restart(tunnel=tunnel)
+    try:
+        result = ServiceManager(_load(selected), selected).restart(tunnel=tunnel)
+    except ServiceStartError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(2) from None
     _print_service_status(result)
 
 
@@ -349,6 +361,7 @@ def serve(
             http_app,
             host=runtime_settings.service.host,
             port=runtime_settings.service.port,
+            log_config=None,
         )
     finally:
         if active_tunnel:
@@ -439,6 +452,16 @@ def acceptance_oauth_ngrok(
     asyncio.run(run_oauth_ngrok(_load(config), include_scopus=False))
 
 
+@acceptance_app.command("oauth-browser-ngrok")
+def acceptance_oauth_browser_ngrok(
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    """Verify one real browser OAuth approval and authenticated MCP through ngrok."""
+    from research_gateway.acceptance import run_oauth_browser_ngrok
+
+    asyncio.run(run_oauth_browser_ngrok(_load(config)))
+
+
 @acceptance_app.command("oauth-scopus-ngrok")
 def acceptance_oauth_scopus_ngrok(
     config: Annotated[Path | None, typer.Option("--config")] = None,
@@ -500,9 +523,19 @@ def _load(config: Path | None):
 
 
 def _print_service_status(result: dict[str, object]) -> None:
-    typer.echo(f"Service: {'running' if result.get('running') else 'stopped'}")
+    classification = result.get("classification")
+    labels = {
+        "managed": "running (managed)",
+        "unmanaged": "running (existing/unmanaged instance)",
+        "port_conflict": "stopped (configured port occupied by another service)",
+        "stopped": "stopped",
+    }
+    fallback = "running" if result.get("running") else "stopped"
+    typer.echo(f"Service: {labels.get(classification, fallback)}")
     if result.get("pid"):
         typer.echo(f"PID: {result['pid']}")
+    if result.get("observed_config_path"):
+        typer.echo(f"Observed config: {result['observed_config_path']}")
     for label, key in (
         ("Local UI", "local_ui_url"),
         ("Local MCP", "local_mcp_url"),
@@ -512,6 +545,8 @@ def _print_service_status(result: dict[str, object]) -> None:
     ):
         if result.get(key):
             typer.echo(f"{label}: {result[key]}")
+    if result.get("running") and result.get("tunnel_state") == "unknown":
+        typer.echo("Tunnel: local gateway healthy; tunnel state unknown")
 
 
 _CONFIG_TEMPLATE = """# Research Gateway global configuration. Keep this file outside Git.
@@ -550,6 +585,7 @@ sealing_secret = ""
 # store_path = "~/.research-gateway/data/runtime/oauth.sqlite3"
 access_token_minutes = 60
 refresh_token_days = 30
+approval_completion_seconds = 90
 
 [tunnel]
 enabled = true
