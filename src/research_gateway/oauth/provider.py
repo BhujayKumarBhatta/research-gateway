@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import logging
 import secrets
 import time
 from dataclasses import dataclass
@@ -24,12 +25,21 @@ from research_gateway.config import McpOAuthSettings
 from research_gateway.oauth.security import csrf_value, keyed_digest, verify_password
 from research_gateway.oauth.store import OAuthStore
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class ApprovalRequest:
     request_id: str
     client_name: str
     scope: str
+
+
+@dataclass(frozen=True)
+class ApprovalResult:
+    redirect_url: str
+    correlation_id: str
+    replayed: bool
 
 
 class SingleUserOAuthProvider(
@@ -46,6 +56,13 @@ class SingleUserOAuthProvider(
 
     def _digest(self, value: str) -> str:
         return keyed_digest(self._signing_secret, value)
+
+    def correlation_id(self, request_id: str) -> str:
+        """Return a safe short flow identifier without revealing the request ID."""
+        return keyed_digest(self._signing_secret, f"oauth-flow:{request_id}")[:12]
+
+    def _authorization_code(self, request_id: str) -> str:
+        return keyed_digest(self._sealing_secret, f"oauth-code:{request_id}")
 
     async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
         payload = self.store.get_client(client_id)
@@ -96,6 +113,9 @@ class SingleUserOAuthProvider(
             "resource": params.resource,
         }
         self.store.put_record("approval", self._digest(request_id), payload, expires_at)
+        logger.info(
+            "oauth authorize request created oauth_flow=%s", self.correlation_id(request_id)
+        )
         return f"{self.settings.issuer_url.rstrip('/')}/oauth/authorize?request={quote(request_id)}"
 
     def approval_page(self, request_id: str) -> tuple[str, str]:
@@ -105,6 +125,7 @@ class SingleUserOAuthProvider(
         client_name = html.escape(str(payload.get("client_name") or "ChatGPT"))
         scope = html.escape(" ".join(payload.get("scopes") or [self.settings.scope]))
         csrf = csrf_value(self._sealing_secret, request_id)
+        logger.info("oauth approval page served oauth_flow=%s", self.correlation_id(request_id))
         return self._render_page(request_id, csrf, client_name, scope), csrf
 
     def approve(
@@ -114,42 +135,79 @@ class SingleUserOAuthProvider(
         csrf: str,
         password: str,
         decision: str,
-    ) -> str:
+    ) -> ApprovalResult:
         expected_csrf = csrf_value(self._sealing_secret, request_id)
         if not secrets.compare_digest(csrf, expected_csrf):
             raise ValueError("Authorization request validation failed.")
         if not verify_password(password, self.settings.admin_password_hash.get_secret_value()):
             raise PermissionError("Authorization password is incorrect.")
-        payload = self.store.consume_record("approval", self._digest(request_id))
+        approval_digest = self._digest(request_id)
+        correlation = self.correlation_id(request_id)
+        payload = self.store.get_record("approval", approval_digest)
         if not payload:
-            raise ValueError("Authorization request is invalid, expired, or already used.")
+            completed = self.store.get_record("approval_complete", approval_digest)
+            if not completed:
+                raise ValueError("Authorization request is invalid, expired, or already used.")
+            logger.info("oauth approval duplicate/replay detected oauth_flow=%s", correlation)
+            return ApprovalResult(
+                redirect_url=self._completed_redirect(request_id, completed),
+                correlation_id=correlation,
+                replayed=True,
+            )
         redirect_uri = str(payload["redirect_uri"])
         state = payload.get("state")
         if decision != "allow":
-            return construct_redirect_uri(
-                redirect_uri,
-                error="access_denied",
-                error_description="Access was not approved",
-                state=state,
+            consumed = self.store.consume_record("approval", approval_digest)
+            if not consumed:
+                raise ValueError("Authorization request is invalid, expired, or already used.")
+            return ApprovalResult(
+                redirect_url=construct_redirect_uri(
+                    redirect_uri,
+                    error="access_denied",
+                    error_description="Access was not approved",
+                    state=state,
+                ),
+                correlation_id=correlation,
+                replayed=False,
             )
-        raw_code = secrets.token_urlsafe(32)
+        raw_code = self._authorization_code(request_id)
+        code_expires_at = time.time() + self.settings.authorization_code_seconds
         code_payload = {
             "client_id": payload["client_id"],
             "scopes": payload["scopes"],
-            "expires_at": time.time() + self.settings.authorization_code_seconds,
+            "expires_at": code_expires_at,
             "code_challenge": payload["code_challenge"],
             "redirect_uri": redirect_uri,
             "redirect_uri_provided_explicitly": payload["redirect_uri_provided_explicitly"],
             "resource": payload["resource"],
             "subject": "research-gateway-owner",
+            "_oauth_flow": correlation,
         }
-        self.store.put_record(
-            "code",
-            self._digest(raw_code),
-            code_payload,
-            float(code_payload["expires_at"]),
+        completion_payload = {
+            "redirect_uri": redirect_uri,
+            "state": state,
+            "_oauth_flow": correlation,
+        }
+        completed = self.store.complete_approval(
+            approval_digest,
+            code_digest=self._digest(raw_code),
+            code_payload=code_payload,
+            code_expires_at=code_expires_at,
+            completion_payload=completion_payload,
+            completion_expires_at=time.time() + self.settings.approval_completion_seconds,
         )
-        return construct_redirect_uri(redirect_uri, code=raw_code, state=state)
+        if not completed:
+            raise ValueError("Authorization request is invalid, expired, or already used.")
+        outcome, saved_completion = completed
+        if outcome == "duplicate":
+            logger.info("oauth approval duplicate/replay detected oauth_flow=%s", correlation)
+        else:
+            logger.info("oauth approval accepted oauth_flow=%s", correlation)
+        return ApprovalResult(
+            redirect_url=self._completed_redirect(request_id, saved_completion),
+            correlation_id=correlation,
+            replayed=outcome == "duplicate",
+        )
 
     async def load_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: str
@@ -165,12 +223,14 @@ class SingleUserOAuthProvider(
         payload = self.store.consume_record("code", self._digest(authorization_code.code))
         if not payload or payload["client_id"] != client.client_id:
             raise TokenError("invalid_grant", "Authorization code was already used")
-        return self._issue_tokens(
+        result = self._issue_tokens(
             client_id=client.client_id,
             scopes=list(payload["scopes"]),
             resource=str(payload["resource"]),
             subject=str(payload["subject"]),
         )
+        logger.info("oauth token exchanged oauth_flow=%s", payload.get("_oauth_flow", "unknown"))
+        return result
 
     async def load_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: str
@@ -282,6 +342,13 @@ class SingleUserOAuthProvider(
             for key, value in payload.items()
             if key in {"client_id", "scopes", "expires_at", "resource", "subject"}
         }
+
+    def _completed_redirect(self, request_id: str, completion: dict[str, object]) -> str:
+        return construct_redirect_uri(
+            str(completion["redirect_uri"]),
+            code=self._authorization_code(request_id),
+            state=completion.get("state"),
+        )
 
     @staticmethod
     def _render_page(request_id: str, csrf: str, client_name: str, scope: str) -> str:

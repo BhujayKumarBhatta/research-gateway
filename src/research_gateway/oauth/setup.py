@@ -66,6 +66,9 @@ def initialize_oauth(
             int(oauth_raw.get("access_token_minutes") or 60)
         ),
         ("mcp_oauth", "refresh_token_days"): str(int(oauth_raw.get("refresh_token_days") or 30)),
+        ("mcp_oauth", "approval_completion_seconds"): str(
+            int(oauth_raw.get("approval_completion_seconds") or 90)
+        ),
     }
     for (section, key), serialized in values.items():
         text = _set_toml_value(text, section, key, serialized)

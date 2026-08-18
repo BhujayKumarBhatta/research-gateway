@@ -318,8 +318,113 @@ def test_oauth_rejects_bad_redirect_resource_state_and_reused_approval(tmp_path:
             "/oauth/authorize",
             headers=REMOTE,
             data={"request": request_id, "csrf": csrf, "password": PASSWORD, "decision": "allow"},
+            follow_redirects=False,
         )
-        assert replay.status_code == 400
+        assert replay.status_code == 302
+        assert replay.headers["location"] == approved.headers["location"]
+
+
+def test_duplicate_approval_reuses_one_code_until_completion_expires(
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    with TestClient(create_app(settings), base_url="https://gateway.example") as client:
+        registration = _register(client)
+        client_id = str(registration["client_id"])
+        start = _begin_authorization(client, client_id)
+        login = client.get(start.headers["location"], headers=REMOTE)
+        request_id, csrf = _approval_fields(login.text)
+        approval = {
+            "request": request_id,
+            "csrf": csrf,
+            "password": PASSWORD,
+            "decision": "allow",
+        }
+
+        first = client.post(
+            "/oauth/authorize", headers=REMOTE, data=approval, follow_redirects=False
+        )
+        duplicate = client.post(
+            "/oauth/authorize", headers=REMOTE, data=approval, follow_redirects=False
+        )
+
+        assert first.status_code == 302
+        assert duplicate.status_code == 302
+        assert duplicate.headers["location"] == first.headers["location"]
+        values = parse_qs(urlparse(first.headers["location"]).query)
+        code = values["code"][0]
+        with sqlite3.connect(settings.mcp_oauth.store_path) as connection:
+            assert (
+                connection.execute(
+                    "SELECT COUNT(*) FROM oauth_records WHERE kind = 'code'"
+                ).fetchone()[0]
+                == 1
+            )
+            assert (
+                connection.execute(
+                    "SELECT COUNT(*) FROM oauth_records WHERE kind = 'approval_complete'"
+                ).fetchone()[0]
+                == 1
+            )
+
+        assert _token(client, client_id, code).status_code == 200
+        assert _token(client, client_id, code).status_code == 400
+
+        with sqlite3.connect(settings.mcp_oauth.store_path) as connection:
+            connection.execute(
+                "UPDATE oauth_records SET expires_at = 0 WHERE kind = 'approval_complete'"
+            )
+        expired_duplicate = client.post(
+            "/oauth/authorize", headers=REMOTE, data=approval, follow_redirects=False
+        )
+        assert expired_duplicate.status_code == 400
+
+
+def test_oauth_lifecycle_logging_uses_only_safe_correlation_ids(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    settings = _settings(tmp_path)
+    caplog.set_level(logging.INFO, logger="research_gateway.oauth")
+    with TestClient(create_app(settings), base_url="https://gateway.example") as client:
+        registration = _register(client)
+        client_id = str(registration["client_id"])
+        start = _begin_authorization(client, client_id)
+        login = client.get(start.headers["location"], headers=REMOTE)
+        request_id, csrf = _approval_fields(login.text)
+        approved = client.post(
+            "/oauth/authorize",
+            headers=REMOTE,
+            data={"request": request_id, "csrf": csrf, "password": PASSWORD, "decision": "allow"},
+            follow_redirects=False,
+        )
+        duplicate = client.post(
+            "/oauth/authorize",
+            headers=REMOTE,
+            data={"request": request_id, "csrf": csrf, "password": PASSWORD, "decision": "allow"},
+            follow_redirects=False,
+        )
+        code = parse_qs(urlparse(approved.headers["location"]).query)["code"][0]
+        assert _token(client, client_id, code).status_code == 200
+        assert duplicate.headers["location"] == approved.headers["location"]
+
+    oauth_log = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.name.startswith("research_gateway.oauth")
+    )
+    for event in (
+        "oauth authorize request created",
+        "oauth approval page served",
+        "oauth approval submitted",
+        "oauth approval accepted",
+        "oauth approval duplicate/replay detected",
+        "oauth callback redirect issued",
+        "oauth token exchanged",
+    ):
+        assert event in oauth_log
+    assert re.search(r"oauth_flow=[0-9a-f]{12}", oauth_log)
+    for secret in (request_id, csrf, PASSWORD, code):
+        assert secret not in oauth_log
 
 
 def test_expired_authorization_code_and_access_token_are_rejected(tmp_path: Path) -> None:

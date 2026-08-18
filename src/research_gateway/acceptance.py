@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import json
 import secrets
 import socket
@@ -8,10 +10,13 @@ import tempfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlencode
 
 import httpx
 import httpx2
 import uvicorn
+from fastapi import Request
+from fastapi.responses import HTMLResponse
 from mcp.client import Client
 from mcp.client.streamable_http import streamable_http_client
 
@@ -21,6 +26,7 @@ from research_gateway.mcp.server import create_mcp_server
 from research_gateway.oauth.client import oauth_mcp_client
 from research_gateway.oauth.security import hash_password
 from research_gateway.oauth.setup import with_oauth_urls
+from research_gateway.operations.logging import install_safe_request_target_filters
 from research_gateway.runtime import GatewayRuntime
 from research_gateway.tunnel import NgrokTunnel
 
@@ -316,28 +322,7 @@ async def run_oauth_ngrok(settings: Settings, *, include_scopus: bool) -> None:
         )
     with tempfile.TemporaryDirectory(prefix="research-gateway-oauth-") as directory:
         root = Path(directory)
-        password = secrets.token_urlsafe(24)
-        temporary = settings.model_copy(deep=True)
-        temporary.database.path = root / "acceptance.db"
-        temporary.service.host = "127.0.0.1"
-        temporary.service.port = _free_port()
-        temporary.tunnel.expose_ui = False
-        temporary.mcp_remote_auth.mode = "oauth"
-        temporary.mcp_remote_auth.allow_unauthenticated = False
-        temporary.mcp_oauth.enabled = True
-        temporary.mcp_oauth.issuer_url = ""
-        temporary.mcp_oauth.resource_url = ""
-        temporary.mcp_oauth.scope = "research-gateway"
-        temporary.mcp_oauth.admin_password_hash = type(temporary.mcp_oauth.admin_password_hash)(
-            hash_password(password)
-        )
-        temporary.mcp_oauth.signing_secret = type(temporary.mcp_oauth.signing_secret)(
-            secrets.token_urlsafe(48)
-        )
-        temporary.mcp_oauth.sealing_secret = type(temporary.mcp_oauth.sealing_secret)(
-            secrets.token_urlsafe(48)
-        )
-        temporary.mcp_oauth.store_path = root / "oauth.sqlite3"
+        temporary, password = _temporary_oauth_settings(settings, root)
         tunnel = NgrokTunnel(temporary, state_path=root / "tunnel.json")
         public = await tunnel.astart()
         try:
@@ -393,6 +378,251 @@ async def run_oauth_ngrok(settings: Settings, *, include_scopus: bool) -> None:
                     print("OAUTH NGROK MCP ACCEPTANCE: PASS")
         finally:
             await tunnel.astop()
+
+
+async def run_oauth_browser_ngrok(settings: Settings) -> None:
+    """Drive the real public OAuth approval flow with Playwright Chromium."""
+    if not settings.tunnel.configured:
+        raise ConfigError(
+            'ngrok is not configured. Add authtoken = "..." under [tunnel] in the global config.'
+        )
+    script = Path(__file__).parents[2] / "ui" / "scripts" / "oauth-browser-ngrok.mjs"
+    playwright = Path(__file__).parents[2] / "ui" / "node_modules" / "playwright"
+    if not script.is_file() or not playwright.exists():
+        raise ConfigError(
+            "Playwright is not installed. Run npm ci and npx playwright install chromium "
+            "in the ui directory."
+        )
+
+    with tempfile.TemporaryDirectory(prefix="research-gateway-oauth-browser-") as directory:
+        root = Path(directory)
+        temporary, password = _temporary_oauth_settings(settings, root)
+        callback_path = "/oauth/acceptance-callback"
+        callback_result: asyncio.Future[dict[str, str]] = asyncio.get_running_loop().create_future()
+
+        tunnel = NgrokTunnel(temporary, state_path=root / "tunnel.json")
+        public = await tunnel.astart()
+        try:
+            if not public.public_url or not public.public_mcp_url:
+                raise RuntimeError("ngrok did not provide a public MCP URL.")
+            callback_origin = public.public_url
+            callback_url = f"{callback_origin}{callback_path}"
+            runtime_settings = with_oauth_urls(temporary, public.public_url)
+            runtime = GatewayRuntime.build(runtime_settings)
+            gateway_app = create_app(runtime_settings, runtime)
+
+            async def oauth_callback(request: Request) -> HTMLResponse:
+                values = {key: value for key, value in request.query_params.items()}
+                if not callback_result.done():
+                    callback_result.set_result(values)
+                return HTMLResponse(
+                    "<!doctype html><html><body>"
+                    "<p data-oauth-callback='received'>OAuth callback received.</p>"
+                    "</body></html>"
+                )
+
+            gateway_app.add_api_route(callback_path, oauth_callback, methods=["GET"])
+            callback_route = gateway_app.router.routes.pop()
+            mcp_mount_index = next(
+                index
+                for index, route in enumerate(gateway_app.router.routes)
+                if getattr(route, "name", None) == "mcp"
+            )
+            gateway_app.router.routes.insert(mcp_mount_index, callback_route)
+
+            async with _serve(gateway_app, runtime_settings.service.port):
+                await _wait_for_health(public.public_health_url or "")
+                verifier = secrets.token_urlsafe(64)
+                challenge = (
+                    base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+                    .decode()
+                    .rstrip("=")
+                )
+                state = secrets.token_urlsafe(32)
+                async with httpx.AsyncClient(timeout=30, follow_redirects=False) as http:
+                    registration = await http.post(
+                        f"{public.public_url}/register",
+                        json={
+                            "client_name": "Research Gateway browser acceptance",
+                            "redirect_uris": [callback_url],
+                            "grant_types": ["authorization_code", "refresh_token"],
+                            "response_types": ["code"],
+                            "scope": runtime_settings.mcp_oauth.scope,
+                            "token_endpoint_auth_method": "none",
+                            "application_type": "native",
+                        },
+                    )
+                    if registration.status_code != 201:
+                        raise RuntimeError("OAuth browser client registration failed.")
+                    client_id = str(registration.json()["client_id"])
+                    authorization_url = f"{public.public_url}/authorize?" + urlencode(
+                        {
+                            "client_id": client_id,
+                            "redirect_uri": callback_url,
+                            "response_type": "code",
+                            "code_challenge": challenge,
+                            "code_challenge_method": "S256",
+                            "state": state,
+                            "scope": runtime_settings.mcp_oauth.scope,
+                            "resource": public.public_mcp_url,
+                        }
+                    )
+                    browser_result = await _run_playwright_browser(
+                        script,
+                        {
+                            "authorization_url": authorization_url,
+                            "password": password,
+                            "gateway_origin": public.public_url,
+                            "callback_origin": callback_origin,
+                            "callback_path": callback_path,
+                        },
+                    )
+                    callback = await asyncio.wait_for(callback_result, timeout=10)
+                    if callback.get("state") != state or not callback.get("code"):
+                        raise RuntimeError("OAuth browser callback state validation failed.")
+                    token = await http.post(
+                        f"{public.public_url}/token",
+                        data={
+                            "grant_type": "authorization_code",
+                            "client_id": client_id,
+                            "code": callback["code"],
+                            "code_verifier": verifier,
+                            "redirect_uri": callback_url,
+                            "resource": public.public_mcp_url,
+                        },
+                    )
+                if token.status_code != 200:
+                    raise RuntimeError("OAuth browser authorization code exchange failed.")
+                tokens = token.json()
+                if not tokens.get("access_token") or not tokens.get("refresh_token"):
+                    raise RuntimeError(
+                        "OAuth browser flow did not issue access and refresh tokens."
+                    )
+                headers = {"Authorization": f"Bearer {tokens['access_token']}"}
+                async with httpx2.AsyncClient(headers=headers) as mcp_http:
+                    transport = streamable_http_client(public.public_mcp_url, http_client=mcp_http)
+                    async with Client(transport) as client:
+                        status = await client.call_tool("gateway_status")
+                        if status.is_error:
+                            raise RuntimeError("OAuth browser MCP gateway_status failed.")
+                events = browser_result.get("events")
+                if not isinstance(events, list):
+                    raise RuntimeError("Playwright did not return safe browser network events.")
+                approval_responses = [
+                    event
+                    for event in events
+                    if isinstance(event, dict)
+                    and event.get("method") == "POST"
+                    and event.get("path") == "/oauth/authorize"
+                ]
+                if not approval_responses or any(
+                    event.get("status") != 302 for event in approval_responses
+                ):
+                    raise RuntimeError("Browser approval POST did not return a safe redirect.")
+                for event in events:
+                    if isinstance(event, dict):
+                        print(
+                            "Browser network: "
+                            f"{event.get('method')} {event.get('path')} -> {event.get('status')}"
+                        )
+                store_bytes = runtime_settings.mcp_oauth.store_path.read_bytes()
+                for raw_secret in (
+                    password,
+                    verifier,
+                    callback["code"],
+                    tokens["access_token"],
+                    tokens["refresh_token"],
+                ):
+                    if raw_secret.encode() in store_bytes:
+                        raise RuntimeError("A raw OAuth browser secret leaked into state storage.")
+                print("OAUTH BROWSER NGROK ACCEPTANCE: PASS")
+        finally:
+            await tunnel.astop()
+
+
+async def _run_playwright_browser(script: Path, payload: dict[str, str]) -> dict[str, object]:
+    """Run the browser harness without placing OAuth values in argv or errors."""
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "node",
+            str(script),
+            cwd=script.parents[1],
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError as error:
+        raise ConfigError("Node.js is required for the Playwright browser acceptance.") from error
+    stdout, _stderr = await process.communicate(json.dumps(payload).encode())
+    try:
+        result = json.loads(stdout.decode())
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("Playwright browser acceptance returned an invalid result.") from error
+    if not isinstance(result, dict):
+        raise RuntimeError("Playwright browser acceptance returned an invalid result.")
+    if process.returncode or result.get("ok") is not True:
+        phase = result.get("phase")
+        known_phases = {
+            "launch",
+            "authorization-navigation",
+            "approval-form",
+            "approval-submit",
+        }
+        safe_phase = phase if phase in known_phases else "unknown"
+        safe_events = []
+        for event in result.get("events", []):
+            if isinstance(event, dict):
+                safe_events.append(
+                    f"{event.get('method')} {event.get('path')} -> {event.get('status')}"
+                )
+        location = result.get("location")
+        safe_location = ""
+        if isinstance(location, dict):
+            safe_location = f" Last page: {location.get('origin')}{location.get('path')}."
+        safe_trace = "; ".join(safe_events[-8:]) or "no browser responses"
+        error_kind = result.get("error_kind")
+        safe_error_kind = (
+            error_kind
+            if error_kind in {"ERR_CONNECTION_REFUSED", "ERR_FAILED", "ERR_ABORTED", "TimeoutError"}
+            else "unknown"
+        )
+        raise RuntimeError(
+            f"Playwright browser flow failed during {safe_phase} ({safe_error_kind})."
+            f"{safe_location} "
+            f"Safe network trace: {safe_trace}."
+        )
+    if result.get("allow_clicks") != 1:
+        raise RuntimeError("Playwright did not perform exactly one approval click.")
+    return result
+
+
+def _temporary_oauth_settings(settings: Settings, root: Path) -> tuple[Settings, str]:
+    """Build isolated OAuth acceptance settings while retaining external credentials."""
+    install_safe_request_target_filters()
+    password = secrets.token_urlsafe(24)
+    temporary = settings.model_copy(deep=True)
+    temporary.database.path = root / "acceptance.db"
+    temporary.service.host = "127.0.0.1"
+    temporary.service.port = _free_port()
+    temporary.tunnel.domain = ""
+    temporary.tunnel.expose_ui = False
+    temporary.mcp_remote_auth.mode = "oauth"
+    temporary.mcp_remote_auth.allow_unauthenticated = False
+    temporary.mcp_oauth.enabled = True
+    temporary.mcp_oauth.issuer_url = ""
+    temporary.mcp_oauth.resource_url = ""
+    temporary.mcp_oauth.scope = "research-gateway"
+    temporary.mcp_oauth.admin_password_hash = type(temporary.mcp_oauth.admin_password_hash)(
+        hash_password(password)
+    )
+    temporary.mcp_oauth.signing_secret = type(temporary.mcp_oauth.signing_secret)(
+        secrets.token_urlsafe(48)
+    )
+    temporary.mcp_oauth.sealing_secret = type(temporary.mcp_oauth.sealing_secret)(
+        secrets.token_urlsafe(48)
+    )
+    temporary.mcp_oauth.store_path = root / "oauth.sqlite3"
+    return temporary, password
 
 
 async def _remote_scopus_flow(client: Client) -> list[object]:

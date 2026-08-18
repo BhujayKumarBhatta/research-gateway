@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import hmac
+import logging
 
 from mcp.server.mcpserver import MCPServer
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 
 from research_gateway.oauth.provider import SingleUserOAuthProvider
+
+logger = logging.getLogger(__name__)
 
 _SECURITY_HEADERS = {
     "Cache-Control": "no-store",
@@ -52,6 +55,8 @@ def install_approval_routes(server: MCPServer[None], provider: SingleUserOAuthPr
             name: value if isinstance(value, str) else ""
             for name, value in ((name, form.get(name)) for name in field_names)
         }
+        correlation = provider.correlation_id(fields["request"])
+        logger.info("oauth approval submitted oauth_flow=%s", correlation)
         cookie = request.cookies.get(_CSRF_COOKIE, "")
         if not cookie or not hmac.compare_digest(cookie, fields["csrf"]):
             return PlainTextResponse(
@@ -60,7 +65,7 @@ def install_approval_routes(server: MCPServer[None], provider: SingleUserOAuthPr
                 headers=_SECURITY_HEADERS,
             )
         try:
-            redirect = provider.approve(
+            result = provider.approve(
                 request_id=fields["request"],
                 csrf=fields["csrf"],
                 password=fields["password"],
@@ -78,6 +83,18 @@ def install_approval_routes(server: MCPServer[None], provider: SingleUserOAuthPr
                 status_code=400,
                 headers=_SECURITY_HEADERS,
             )
-        response = RedirectResponse(redirect, status_code=302, headers=_SECURITY_HEADERS)
-        response.delete_cookie(_CSRF_COOKIE, path="/oauth/authorize")
+        logger.info("oauth callback redirect issued oauth_flow=%s", result.correlation_id)
+        response = RedirectResponse(result.redirect_url, status_code=302, headers=_SECURITY_HEADERS)
+        if fields["decision"] == "allow":
+            response.set_cookie(
+                _CSRF_COOKIE,
+                fields["csrf"],
+                httponly=True,
+                secure=provider.settings.issuer_url.startswith("https://"),
+                samesite="strict",
+                max_age=provider.settings.approval_completion_seconds,
+                path="/oauth/authorize",
+            )
+        else:
+            response.delete_cookie(_CSRF_COOKIE, path="/oauth/authorize")
         return response

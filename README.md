@@ -109,7 +109,17 @@ Add `--tunnel` to `start` or `restart` to keep the authenticated public MCP endp
 running. A timestamped Excel workbook is created on service start and
 `backups/latest.xlsx` always points to the newest completed snapshot. Logs rotate at
 the configured size and configured credentials are removed by the central redaction
-filter.
+filter. Follow the active WSL log without stopping the service with:
+
+```bash
+tail -f /mnt/d/AI/research-gateway/logs/research-gateway.log
+```
+
+Press `Ctrl+C` to stop only the log follower. It does not stop Research Gateway.
+Starting an already healthy gateway is a safe no-op, even if its saved runtime-state
+file is stale. Status distinguishes a managed process, an already-running unmanaged
+gateway, a stopped service, and a port occupied by another program. It never adopts
+or terminates an unmanaged process automatically.
 
 ## Private remote MCP through ngrok
 
@@ -123,7 +133,7 @@ uv run research-gateway service start --tunnel
 uv run research-gateway tunnel-status
 ```
 
-The server still binds to loopback. The public hostname reaches only `/health`, OAuth discovery and approval routes, and OAuth-protected `/mcp`; `/ui` and `/api/v1` remain local. The password is kept as a strong salted hash. Authorization codes and tokens are stored only as keyed digests, which are one-way fingerprints used for lookup.
+The server still binds to loopback. The public hostname reaches only `/health`, OAuth discovery and approval routes, and OAuth-protected `/mcp`; `/ui` and `/api/v1` remain local. The password is kept as a strong salted hash. Authorization codes and tokens are stored only as keyed digests, which are one-way fingerprints used for lookup. If a browser repeats the same successful approval POST immediately, the gateway returns the same redirect for up to 90 seconds. This makes a transport retry harmless while the authorization code itself remains redeemable only once.
 
 In ChatGPT create a custom MCP connector with **Name = Research Gateway**, **Server URL = the displayed public URL followed by `/mcp`**, and **Authentication = OAuth**. Leave Advanced OAuth Settings automatic; the gateway publishes protected-resource and authorization-server metadata. Static bearer mode remains available for older clients by setting `[mcp_remote_auth] mode = "static_bearer"`, but it is not mixed with OAuth.
 
@@ -154,6 +164,7 @@ uv run research-gateway acceptance live-licensed
 uv run research-gateway acceptance remote-ngrok
 uv run research-gateway acceptance live-scopus-ngrok
 uv run research-gateway acceptance oauth-ngrok
+uv run research-gateway acceptance oauth-browser-ngrok
 uv run research-gateway acceptance oauth-scopus-ngrok
 ```
 
