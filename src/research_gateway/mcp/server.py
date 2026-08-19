@@ -24,6 +24,9 @@ LOCAL_WRITE = ToolAnnotations(
 REMOTE_WRITE = ToolAnnotations(
     read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=True
 )
+REMOTE_DESTRUCTIVE = ToolAnnotations(
+    read_only_hint=False, destructive_hint=True, idempotent_hint=False, open_world_hint=True
+)
 
 
 def create_mcp_server(
@@ -780,6 +783,212 @@ def create_mcp_server(
     )
     async def zotero_credential_status_tool() -> dict[str, Any]:
         return await runtime.zotero.credential_status()
+
+    @server.tool(
+        name="zotero_create_collection",
+        description=(
+            "Idempotently create a top-level Zotero collection or a subcollection under "
+            "parent_collection_key."
+        ),
+        annotations=REMOTE_WRITE,
+    )
+    async def zotero_create_collection_tool(
+        name: str, parent_collection_key: str | None = None
+    ) -> dict[str, Any]:
+        return await runtime.zotero.create_collection(
+            name, parent_collection_key=parent_collection_key
+        )
+
+    @server.tool(
+        name="zotero_delete_collection",
+        description=(
+            "Inspect or delete one Zotero collection. Dry-run is the default; a non-empty "
+            "collection requires recursive=true, which preserves its bibliography items."
+        ),
+        annotations=REMOTE_DESTRUCTIVE,
+    )
+    async def zotero_delete_collection_tool(
+        collection_key: str, dry_run: bool = True, recursive: bool = False
+    ) -> dict[str, Any]:
+        return await runtime.zotero.delete_collection(
+            collection_key, dry_run=dry_run, recursive=recursive
+        )
+
+    @server.tool(
+        name="zotero_create_item",
+        description=(
+            "Plan or idempotently create one approved Zotero item from canonical evidence "
+            "or supplied metadata. Dry-run is the default."
+        ),
+        annotations=REMOTE_WRITE,
+    )
+    async def zotero_create_item_tool(
+        evidence_id: str | None = None,
+        title: str | None = None,
+        authors: list[dict[str, Any]] | None = None,
+        year: str | None = None,
+        doi: str | None = None,
+        url: str | None = None,
+        item_type: str | None = None,
+        collection_keys: list[str] | None = None,
+        tags: list[str] | None = None,
+        arxiv_id: str | None = None,
+        dry_run: bool = True,
+    ) -> dict[str, Any]:
+        return await runtime.zotero.create_item(
+            evidence_id=evidence_id,
+            title=title,
+            authors=authors,
+            year=year,
+            doi=doi,
+            url=url,
+            item_type=item_type,
+            collection_keys=collection_keys,
+            tags=tags,
+            arxiv_id=arxiv_id,
+            dry_run=dry_run,
+        )
+
+    @server.tool(
+        name="zotero_delete_item",
+        description=(
+            "Inspect or delete one Zotero bibliographic item with version protection. "
+            "Dry-run is the default; items with child notes or attachments are refused."
+        ),
+        annotations=REMOTE_DESTRUCTIVE,
+    )
+    async def zotero_delete_item_tool(item_key: str, dry_run: bool = True) -> dict[str, Any]:
+        return await runtime.zotero.delete_item(item_key, dry_run=dry_run)
+
+    @server.tool(
+        name="zotero_add_item_to_collection",
+        description="Add an existing Zotero item to a collection without duplicating the item.",
+        annotations=REMOTE_WRITE,
+    )
+    async def zotero_add_item_to_collection_tool(
+        item_key: str, collection_key: str
+    ) -> dict[str, Any]:
+        return await runtime.zotero.add_item_to_collection(item_key, collection_key)
+
+    @server.tool(
+        name="zotero_remove_item_from_collection",
+        description="Remove one collection membership without deleting the Zotero item.",
+        annotations=REMOTE_WRITE,
+    )
+    async def zotero_remove_item_from_collection_tool(
+        item_key: str, collection_key: str
+    ) -> dict[str, Any]:
+        return await runtime.zotero.remove_item_from_collection(item_key, collection_key)
+
+    @server.tool(
+        name="zotero_add_tags",
+        description="Add extensible research tags while preserving every existing Zotero tag.",
+        annotations=REMOTE_WRITE,
+    )
+    async def zotero_add_tags_tool(item_key: str, tags: list[str]) -> dict[str, Any]:
+        return await runtime.zotero.add_tags(item_key, tags)
+
+    @server.tool(
+        name="zotero_remove_tags",
+        description="Remove only selected Zotero tags while preserving unrelated tags.",
+        annotations=REMOTE_WRITE,
+    )
+    async def zotero_remove_tags_tool(item_key: str, tags: list[str]) -> dict[str, Any]:
+        return await runtime.zotero.remove_tags(item_key, tags)
+
+    @server.tool(
+        name="zotero_set_tags",
+        description=(
+            "Set Zotero research tags; preserve_existing defaults to true to retain unrelated tags."
+        ),
+        annotations=REMOTE_WRITE,
+    )
+    async def zotero_set_tags_tool(
+        item_key: str, tags: list[str], preserve_existing: bool = True
+    ) -> dict[str, Any]:
+        return await runtime.zotero.set_tags(item_key, tags, preserve_existing=preserve_existing)
+
+    @server.tool(
+        name="zotero_get_citation_metadata",
+        description=(
+            "Retrieve structured Zotero bibliographic metadata plus Zotero-rendered citation "
+            "and bibliography text for up to 50 selected item keys."
+        ),
+        annotations=REMOTE_READ,
+    )
+    async def zotero_get_citation_metadata_tool(
+        item_keys: list[str], style: str = "apa", locale: str = "en-US"
+    ) -> dict[str, Any]:
+        return await runtime.zotero.get_citation_metadata(item_keys, style=style, locale=locale)
+
+    @server.tool(
+        name="zotero_format_citation",
+        description=(
+            "Render in-text citations from selected Zotero items with an official CSL style."
+        ),
+        annotations=REMOTE_READ,
+    )
+    async def zotero_format_citation_tool(
+        item_keys: list[str], style: str = "apa", locale: str = "en-US"
+    ) -> dict[str, Any]:
+        return await runtime.zotero.format_citation(item_keys, style=style, locale=locale)
+
+    @server.tool(
+        name="zotero_format_bibliography",
+        description="Render bibliography entries from the same selected Zotero records.",
+        annotations=REMOTE_READ,
+    )
+    async def zotero_format_bibliography_tool(
+        item_keys: list[str], style: str = "apa", locale: str = "en-US"
+    ) -> dict[str, Any]:
+        return await runtime.zotero.format_bibliography(item_keys, style=style, locale=locale)
+
+    @server.tool(
+        name="zotero_get_link_for_evidence",
+        description="Read the durable Zotero item mapping for one Research Gateway evidence ID.",
+        annotations=READ_ONLY,
+    )
+    async def zotero_get_link_for_evidence_tool(evidence_id: str) -> dict[str, Any]:
+        return await runtime.zotero.get_link_for_evidence(evidence_id)
+
+    @server.tool(
+        name="zotero_get_link_for_item",
+        description="Read the Research Gateway evidence mapping for one Zotero item key.",
+        annotations=READ_ONLY,
+    )
+    async def zotero_get_link_for_item_tool(item_key: str) -> dict[str, Any]:
+        return await runtime.zotero.get_link_for_item(item_key)
+
+    @server.tool(
+        name="zotero_record_citation_reference",
+        description=(
+            "Record minimum durable provenance from a manuscript location to a Zotero item "
+            "and its linked reviewed evidence."
+        ),
+        annotations=LOCAL_WRITE,
+    )
+    async def zotero_record_citation_reference_tool(
+        manuscript: str,
+        item_key: str,
+        citation_location: str | None = None,
+        rationale: str = "",
+    ) -> dict[str, Any]:
+        return await runtime.zotero.record_citation_reference(
+            manuscript=manuscript,
+            item_key=item_key,
+            citation_location=citation_location,
+            rationale=rationale,
+        )
+
+    @server.tool(
+        name="zotero_list_citation_references",
+        description="List durable manuscript-to-Zotero citation provenance records.",
+        annotations=READ_ONLY,
+    )
+    async def zotero_list_citation_references_tool(
+        manuscript: str | None = None, limit: int = 100
+    ) -> dict[str, Any]:
+        return await runtime.zotero.list_citation_references(manuscript=manuscript, limit=limit)
 
     @server.tool(
         name="github_propose_change",

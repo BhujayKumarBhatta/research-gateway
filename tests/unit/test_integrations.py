@@ -84,7 +84,7 @@ async def test_zotero_dry_run_does_not_call_remote(tmp_path: Path) -> None:
         "deleted": 0,
         "files_uploaded": 0,
     }
-    assert requests == ["GET"]
+    assert requests == ["GET", "GET"]
     await client.aclose()
 
 
@@ -120,7 +120,7 @@ async def test_zotero_write_is_idempotent_from_durable_link(tmp_path: Path) -> N
     assert second["created"] == 0
     assert second["created_items"] == []
     assert second["already_linked"] == 1
-    assert calls == 2
+    assert calls == 3
     assert await database.get_zotero_link(evidence_id, "user", "42")
     await client.aclose()
 

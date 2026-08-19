@@ -297,7 +297,7 @@ async def test_complete_multi_source_fixture_acceptance(tmp_path: Path) -> None:
             )
             assert zotero_item.structured_content["item_key"] == searched_item["item_key"]
             assert zotero_item.structured_content["title"] == searched_item["title"]
-            assert status.structured_content["database_schema"] == 2
+            assert status.structured_content["database_schema"] == 3
             assert zotero_permissions.structured_content["library_read"] is True
             assert zotero_permissions.structured_content["library_write"] is True
             assert all(

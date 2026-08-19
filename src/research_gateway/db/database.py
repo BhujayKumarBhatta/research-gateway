@@ -20,7 +20,7 @@ from research_gateway.domain.models import (
     SourceRecord,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _SAFE_TABLES = {
     "studies",
     "topics",
@@ -33,6 +33,7 @@ _SAFE_TABLES = {
     "audit_events",
     "possible_duplicates",
     "zotero_links",
+    "citation_references",
     "github_operations",
 }
 
@@ -244,6 +245,22 @@ class EvidenceDatabase:
                     synced_at TEXT NOT NULL,
                     PRIMARY KEY(evidence_id, library_type, library_id)
                 );
+                CREATE INDEX IF NOT EXISTS idx_zotero_links_item
+                    ON zotero_links(library_type, library_id, item_key);
+                CREATE TABLE IF NOT EXISTS citation_references (
+                    citation_reference_id TEXT PRIMARY KEY,
+                    manuscript TEXT NOT NULL,
+                    citation_location TEXT,
+                    library_type TEXT NOT NULL,
+                    library_id TEXT NOT NULL,
+                    item_key TEXT NOT NULL,
+                    evidence_id TEXT REFERENCES evidence(evidence_id) ON DELETE SET NULL,
+                    identifier TEXT,
+                    rationale TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_citation_references_manuscript
+                    ON citation_references(manuscript, created_at);
                 CREATE TABLE IF NOT EXISTS github_operations (
                     operation_id TEXT PRIMARY KEY,
                     operation TEXT NOT NULL,
@@ -899,6 +916,68 @@ class EvidenceDatabase:
         row["discoveries"] = await self.list_discoveries(evidence_id)
         return row
 
+    async def export_relations(
+        self, evidence_ids: list[str]
+    ) -> dict[str, dict[str, list[dict[str, Any]]]]:
+        """Load export-only related rows in batches instead of opening per-record connections."""
+        grouped: dict[str, dict[str, list[dict[str, Any]]]] = {
+            "identifiers": {},
+            "discoveries": {},
+            "screening": {},
+        }
+        selected = list(dict.fromkeys(evidence_ids))
+        if not selected:
+            return grouped
+        connection = await self._connect()
+        try:
+            for start in range(0, len(selected), 500):
+                batch = selected[start : start + 500]
+                placeholders = ",".join("?" for _ in batch)
+                identifier_rows = await (
+                    await connection.execute(
+                        "SELECT evidence_id,identifier_type,identifier_value,source_provider "
+                        "FROM evidence_identifiers "
+                        f"WHERE evidence_id IN ({placeholders}) "
+                        "ORDER BY evidence_id,identifier_type",
+                        batch,
+                    )
+                ).fetchall()
+                discovery_rows = await (
+                    await connection.execute(
+                        "SELECT h.evidence_id,h.provider,h.provider_record_id,h.rank,"
+                        "h.discovered_at,r.search_run_id,r.search_code,r.study_id,r.topic_id,"
+                        "r.mode,r.label,r.search_intent,r.provider_query,r.executed_at_utc "
+                        "FROM search_hits h "
+                        "JOIN search_runs r ON r.search_run_id=h.search_run_id "
+                        f"WHERE h.evidence_id IN ({placeholders}) "
+                        "ORDER BY h.evidence_id,r.executed_at_utc,h.rank",
+                        batch,
+                    )
+                ).fetchall()
+                screening_rows = await (
+                    await connection.execute(
+                        "SELECT * FROM screening_events "
+                        f"WHERE evidence_id IN ({placeholders}) "
+                        "ORDER BY evidence_id,timestamp_utc",
+                        batch,
+                    )
+                ).fetchall()
+                for row in identifier_rows:
+                    item = dict(row)
+                    evidence_id = str(item.pop("evidence_id"))
+                    grouped["identifiers"].setdefault(evidence_id, []).append(item)
+                for row in discovery_rows:
+                    item = dict(row)
+                    evidence_id = str(item.pop("evidence_id"))
+                    grouped["discoveries"].setdefault(evidence_id, []).append(item)
+                for row in screening_rows:
+                    item = dict(row)
+                    evidence_id = str(item["evidence_id"])
+                    grouped["screening"].setdefault(evidence_id, []).append(item)
+            return grouped
+        finally:
+            await connection.close()
+
     async def add_note(self, evidence_id: str, text: str, actor: str) -> dict[str, Any]:
         note_id = str(uuid.uuid4())
         now = _utc_text()
@@ -996,6 +1075,89 @@ class EvidenceDatabase:
             await connection.commit()
         finally:
             await connection.close()
+
+    async def get_zotero_link_by_item_key(
+        self, item_key: str, library_type: str, library_id: str
+    ) -> dict[str, Any] | None:
+        return await self._fetch_one(
+            "SELECT * FROM zotero_links WHERE item_key=? AND library_type=? AND library_id=? "
+            "ORDER BY synced_at DESC LIMIT 1",
+            (item_key, library_type, library_id),
+        )
+
+    async def delete_zotero_links_by_item_key(
+        self, item_key: str, library_type: str, library_id: str
+    ) -> int:
+        connection = await self._connect()
+        try:
+            cursor = await connection.execute(
+                "DELETE FROM zotero_links WHERE item_key=? AND library_type=? AND library_id=?",
+                (item_key, library_type, library_id),
+            )
+            await connection.commit()
+            return int(cursor.rowcount)
+        finally:
+            await connection.close()
+
+    async def save_citation_reference(
+        self,
+        *,
+        manuscript: str,
+        citation_location: str | None,
+        library_type: str,
+        library_id: str,
+        item_key: str,
+        evidence_id: str | None,
+        identifier: str | None,
+        rationale: str = "",
+    ) -> dict[str, Any]:
+        citation_reference_id = str(uuid.uuid4())
+        created_at = _utc_text()
+        connection = await self._connect()
+        try:
+            await connection.execute(
+                "INSERT INTO citation_references VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    citation_reference_id,
+                    manuscript,
+                    citation_location,
+                    library_type,
+                    library_id,
+                    item_key,
+                    evidence_id,
+                    identifier,
+                    rationale,
+                    created_at,
+                ),
+            )
+            await connection.commit()
+        finally:
+            await connection.close()
+        return {
+            "citation_reference_id": citation_reference_id,
+            "manuscript": manuscript,
+            "citation_location": citation_location,
+            "library_type": library_type,
+            "library_id": library_id,
+            "item_key": item_key,
+            "evidence_id": evidence_id,
+            "identifier": identifier,
+            "rationale": rationale,
+            "created_at": created_at,
+        }
+
+    async def list_citation_references(
+        self, *, manuscript: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        if manuscript:
+            return await self._fetch_all(
+                "SELECT * FROM citation_references WHERE manuscript=? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (manuscript, limit),
+            )
+        return await self._fetch_all(
+            "SELECT * FROM citation_references ORDER BY created_at DESC LIMIT ?", (limit,)
+        )
 
     async def record_github_operation(
         self,

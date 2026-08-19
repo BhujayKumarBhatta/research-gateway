@@ -12,7 +12,9 @@ from research_gateway.services.exports import ExportService
 
 
 @pytest.mark.asyncio
-async def test_all_export_formats_include_evidence_and_provenance(tmp_path: Path) -> None:
+async def test_all_export_formats_include_evidence_and_provenance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     database = EvidenceDatabase(tmp_path / "evidence.db")
     await database.migrate()
     await database.create_study("s1", "Study", "Purpose")
@@ -39,6 +41,7 @@ async def test_all_export_formats_include_evidence_and_provenance(tmp_path: Path
             abstract="A result",
             year=2024,
             identifiers={"arxiv_id": "2401.1"},
+            open_access={"status": "gold"},
         ),
     )
     await database.complete_search_run(
@@ -52,6 +55,15 @@ async def test_all_export_formats_include_evidence_and_provenance(tmp_path: Path
     await database.set_screening(
         outcome.evidence_id, "final", reason=None, note="accepted", actor="test"
     )
+    connection_count = 0
+    original_connect = database._connect
+
+    async def counted_connect():
+        nonlocal connection_count
+        connection_count += 1
+        return await original_connect()
+
+    monkeypatch.setattr(database, "_connect", counted_connect)
     exporter = ExportService(database)
     for format in ("json", "csv", "xlsx", "markdown"):
         result = await exporter.export(tmp_path / f"export.{format}", format=format, study_id="s1")
@@ -60,6 +72,10 @@ async def test_all_export_formats_include_evidence_and_provenance(tmp_path: Path
         assert Path(result["path"]).is_file()
     payload = json.loads((tmp_path / "export.json").read_text())
     assert payload["discoveries"][0]["provider"] == "arxiv"
+    assert payload["evidence"][0]["identifiers"][0]["identifier_type"] == "arxiv_id"
+    assert payload["evidence"][0]["discoveries"][0]["provider"] == "arxiv"
+    assert payload["evidence"][0]["open_access"] == {"status": "gold"}
+    assert payload["screening"][0]["new_status"] == "final"
     assert payload["search_runs"][0]["provider_query"] == "all:gateway"
     assert "Research gateway evidence" in (tmp_path / "export.csv").read_text()
     assert "Research gateway evidence" in (tmp_path / "export.markdown").read_text()
@@ -71,3 +87,6 @@ async def test_all_export_formats_include_evidence_and_provenance(tmp_path: Path
         "Screening",
         "Topics",
     ]
+    assert connection_count <= 20
+    with pytest.raises(ValueError, match="Unknown export format: xml"):
+        await exporter.export(tmp_path / "export.xml", format="xml")  # type: ignore[arg-type]

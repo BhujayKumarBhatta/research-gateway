@@ -17,4 +17,4 @@ Remote access is narrow:
 - tunnel runtime state contains only the public URL, process ID, start time, and exposed paths;
 - listener shutdown runs even after an error.
 
-External writes remain bounded. Zotero sync creates or reuses bibliography items but never deletes or uploads files. GitHub proposals use a new branch, non-force commit, and pull request. They never write the default branch directly, merge, delete, or change repository settings.
+External writes remain bounded. Zotero creates or reuses bibliography items, preserves unrelated tags, and defaults every item or collection deletion to a dry run. Real deletion uses the current object version; non-empty collections require explicit recursion that preserves bibliography items, and items with child notes or attachments are refused. Zotero never uploads files. GitHub proposals use a new branch, non-force commit, and pull request. They never write the default branch directly, merge, delete, or change repository settings.
