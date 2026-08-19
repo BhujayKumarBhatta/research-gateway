@@ -916,6 +916,68 @@ class EvidenceDatabase:
         row["discoveries"] = await self.list_discoveries(evidence_id)
         return row
 
+    async def export_relations(
+        self, evidence_ids: list[str]
+    ) -> dict[str, dict[str, list[dict[str, Any]]]]:
+        """Load export-only related rows in batches instead of opening per-record connections."""
+        grouped: dict[str, dict[str, list[dict[str, Any]]]] = {
+            "identifiers": {},
+            "discoveries": {},
+            "screening": {},
+        }
+        selected = list(dict.fromkeys(evidence_ids))
+        if not selected:
+            return grouped
+        connection = await self._connect()
+        try:
+            for start in range(0, len(selected), 500):
+                batch = selected[start : start + 500]
+                placeholders = ",".join("?" for _ in batch)
+                identifier_rows = await (
+                    await connection.execute(
+                        "SELECT evidence_id,identifier_type,identifier_value,source_provider "
+                        "FROM evidence_identifiers "
+                        f"WHERE evidence_id IN ({placeholders}) "
+                        "ORDER BY evidence_id,identifier_type",
+                        batch,
+                    )
+                ).fetchall()
+                discovery_rows = await (
+                    await connection.execute(
+                        "SELECT h.evidence_id,h.provider,h.provider_record_id,h.rank,"
+                        "h.discovered_at,r.search_run_id,r.search_code,r.study_id,r.topic_id,"
+                        "r.mode,r.label,r.search_intent,r.provider_query,r.executed_at_utc "
+                        "FROM search_hits h "
+                        "JOIN search_runs r ON r.search_run_id=h.search_run_id "
+                        f"WHERE h.evidence_id IN ({placeholders}) "
+                        "ORDER BY h.evidence_id,r.executed_at_utc,h.rank",
+                        batch,
+                    )
+                ).fetchall()
+                screening_rows = await (
+                    await connection.execute(
+                        "SELECT * FROM screening_events "
+                        f"WHERE evidence_id IN ({placeholders}) "
+                        "ORDER BY evidence_id,timestamp_utc",
+                        batch,
+                    )
+                ).fetchall()
+                for row in identifier_rows:
+                    item = dict(row)
+                    evidence_id = str(item.pop("evidence_id"))
+                    grouped["identifiers"].setdefault(evidence_id, []).append(item)
+                for row in discovery_rows:
+                    item = dict(row)
+                    evidence_id = str(item.pop("evidence_id"))
+                    grouped["discoveries"].setdefault(evidence_id, []).append(item)
+                for row in screening_rows:
+                    item = dict(row)
+                    evidence_id = str(item["evidence_id"])
+                    grouped["screening"].setdefault(evidence_id, []).append(item)
+            return grouped
+        finally:
+            await connection.close()
+
     async def add_note(self, evidence_id: str, text: str, actor: str) -> dict[str, Any]:
         note_id = str(uuid.uuid4())
         now = _utc_text()

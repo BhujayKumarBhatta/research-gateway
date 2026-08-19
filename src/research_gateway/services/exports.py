@@ -33,18 +33,25 @@ class ExportService:
             final=True if final_only else None,
             limit=100_000,
         )
+        related = await self.database.export_relations(
+            [str(item["evidence_id"]) for item in page.items]
+        )
         evidence = []
         discoveries = []
         screening = []
         for item in page.items:
-            details = await self.database.get_evidence(item["evidence_id"])
-            if details:
-                paths = details.pop("discoveries")
-                discoveries.extend(paths)
-                details["first_discovery"] = paths[0]["executed_at_utc"] if paths else None
-                details["last_discovery"] = paths[-1]["executed_at_utc"] if paths else None
-                evidence.append(details)
-                screening.extend(await self.database.screening_history(item["evidence_id"]))
+            details = dict(item)
+            evidence_id = str(details["evidence_id"])
+            raw_open_access = details.pop("open_access_json", None)
+            details["open_access"] = json.loads(raw_open_access) if raw_open_access else None
+            details["identifiers"] = related["identifiers"].get(evidence_id, [])
+            paths = related["discoveries"].get(evidence_id, [])
+            details["discoveries"] = paths
+            discoveries.extend(paths)
+            details["first_discovery"] = paths[0]["executed_at_utc"] if paths else None
+            details["last_discovery"] = paths[-1]["executed_at_utc"] if paths else None
+            evidence.append(details)
+            screening.extend(related["screening"].get(evidence_id, []))
         runs = await self.database.list_search_runs(study_id=study_id, limit=100_000)
         topics = await self.database.list_topics(study_id) if study_id else []
         if format == "json":

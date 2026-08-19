@@ -32,6 +32,8 @@ async def test_migrations_create_versioned_schema(database: EvidenceDatabase) ->
         "zotero_links",
         "citation_references",
     }.issubset(tables)
+    with pytest.raises(ValueError, match="Unknown table"):
+        await database.count_rows("sqlite_master")
 
 
 @pytest.mark.asyncio

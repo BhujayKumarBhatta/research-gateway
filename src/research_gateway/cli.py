@@ -331,16 +331,21 @@ def serve(
     log_path = configure_logging(settings)
     logging.getLogger(__name__).info("Preparing Research Gateway service.")
     if settings.backup.enabled and settings.backup.on_service_start:
+        logging.getLogger(__name__).info("Creating startup Excel backup.")
 
-        async def prepare_backup() -> None:
+        async def prepare_backup() -> int:
             database = EvidenceDatabase(settings.database.path)
             await database.migrate()
             directory = settings.backup.directory or settings.database.path.parent / "backups"
-            await ExcelBackupService(
+            result = await ExcelBackupService(
                 database, directory, retention_count=settings.backup.retention_count
             ).create()
+            return result.evidence_count
 
-        asyncio.run(prepare_backup())
+        evidence_count = asyncio.run(prepare_backup())
+        logging.getLogger(__name__).info(
+            "Startup Excel backup completed for %d evidence records.", evidence_count
+        )
     should_tunnel = settings.tunnel.start_on_serve if tunnel is None else tunnel
     active_tunnel = NgrokTunnel(settings) if should_tunnel else None
     try:
