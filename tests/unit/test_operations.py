@@ -15,6 +15,7 @@ from research_gateway.db.database import EvidenceDatabase
 from research_gateway.operations.backups import ExcelBackupService
 from research_gateway.operations.logging import configure_logging
 from research_gateway.operations.service import ServiceManager, ServiceStartError
+from research_gateway.operations.supervisor import SystemdUserSupervisor
 
 
 @pytest.mark.asyncio
@@ -444,3 +445,128 @@ def test_service_cli_start_is_friendly_noop_for_existing_gateway(
     assert "Service: running (existing/unmanaged instance)" in result.output
     assert "Public MCP: https://example.ngrok.app/mcp" in result.output
     assert "Service start: no action required." in result.output
+
+
+def test_service_cli_uses_matching_supervisor_for_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text(
+        "\n".join(
+            (
+                "[service]",
+                'host = "127.0.0.1"',
+                "port = 8877",
+                "[database]",
+                f'path = "{tmp_path / "gateway.db"}"',
+            )
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        SystemdUserSupervisor,
+        "manages_config",
+        property(lambda self: True),
+    )
+    monkeypatch.setattr(
+        SystemdUserSupervisor,
+        "start",
+        lambda self, manager: {
+            "running": True,
+            "classification": "supervised",
+            "pid": 4321,
+            "supervisor_installed": True,
+            "supervisor_enabled": True,
+            "supervisor_restarts": 1,
+            "supervisor_log_path": str(tmp_path / "supervisor.log"),
+            "started": True,
+        },
+    )
+    monkeypatch.setattr(
+        ServiceManager,
+        "start",
+        lambda *args, **kwargs: pytest.fail("detached start must not be used"),
+    )
+
+    result = CliRunner().invoke(app, ["service", "start", "--config", str(config)])
+
+    assert result.exit_code == 0
+    assert "Service: running (supervised with automatic recovery)" in result.output
+    assert "Supervisor: enabled" in result.output
+    assert "Automatic restarts: 1" in result.output
+
+
+def test_service_install_replaces_owned_detached_process_and_starts_supervisor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text(
+        "\n".join(
+            (
+                "[service]",
+                'host = "127.0.0.1"',
+                "port = 8877",
+                "[database]",
+                f'path = "{tmp_path / "gateway.db"}"',
+            )
+        ),
+        encoding="utf-8",
+    )
+    calls: list[object] = []
+    monkeypatch.setattr(
+        SystemdUserSupervisor,
+        "validate_durable_location",
+        lambda self: calls.append("validate"),
+    )
+    monkeypatch.setattr(
+        SystemdUserSupervisor,
+        "installed",
+        property(lambda self: False),
+    )
+    monkeypatch.setattr(
+        ServiceManager,
+        "status",
+        lambda self: {"running": True, "classification": "managed", "pid": 111},
+    )
+    monkeypatch.setattr(
+        ServiceManager,
+        "stop",
+        lambda self: calls.append("stop-detached") or {"stopped": True},
+    )
+    monkeypatch.setattr(
+        SystemdUserSupervisor,
+        "install",
+        lambda self, *, tunnel: calls.append(("install", tunnel)) or {"installed": True},
+    )
+    monkeypatch.setattr(
+        SystemdUserSupervisor,
+        "start",
+        lambda self, manager: (
+            calls.append("start-supervisor")
+            or {
+                "running": True,
+                "classification": "supervised",
+                "supervisor_enabled": True,
+                "started": True,
+            }
+        ),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "service",
+            "install",
+            "--tunnel",
+            "--config",
+            str(config),
+            "--working-directory",
+            str(tmp_path / "repository"),
+            "--python-executable",
+            str(tmp_path / ".venv" / "bin" / "python"),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls == ["validate", "stop-detached", ("install", True), "start-supervisor"]
+    assert "Supervision installed and service started." in result.output

@@ -101,7 +101,25 @@ unknown rather than being called peer reviewed without evidence.
 
 ## Background service, logs, and Excel safety copy
 
-Use the lifecycle commands for normal day-to-day operation:
+Install automatic recovery once from the durable repository checkout. In WSL, this
+uses the user service manager (systemd) to restart Research Gateway five seconds
+after an unexpected process failure. It validates the external configuration before
+every attempt and writes startup output to a separate supervisor log.
+
+```bash
+cd /home/bhujay/ai-workspace/research-gateway
+uv run research-gateway service install --tunnel
+```
+
+The installed service is enabled for later WSL login sessions. To allow the user
+service manager to start without an interactive login, an administrator can enable
+user lingering once:
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
+Use the lifecycle commands for normal day-to-day operation after installation:
 
 ```bash
 uv run research-gateway service start
@@ -110,8 +128,9 @@ uv run research-gateway service restart
 uv run research-gateway service stop
 ```
 
-Add `--tunnel` to `start` or `restart` to keep the authenticated public MCP endpoint
-running. A timestamped Excel workbook is created on service start and
+The installed tunnel choice is retained when `start` or `restart` is called without
+a tunnel flag. An explicit `--tunnel` or `--no-tunnel` safely changes that choice and
+restarts the owned unit when required. A timestamped Excel workbook is created on service start and
 `backups/latest.xlsx` always points to the newest completed snapshot. Logs rotate at
 the configured size and configured credentials are removed by the central redaction
 filter. Follow the active WSL log without stopping the service with:
@@ -120,11 +139,21 @@ filter. Follow the active WSL log without stopping the service with:
 tail -f /mnt/d/AI/research-gateway/logs/research-gateway.log
 ```
 
+If configuration validation or process startup fails, follow the supervisor's
+startup and retry output with:
+
+```bash
+tail -f /mnt/d/AI/research-gateway/logs/research-gateway-supervisor.log
+```
+
 Press `Ctrl+C` to stop only the log follower. It does not stop Research Gateway.
 Starting an already healthy gateway is a safe no-op, even if its saved runtime-state
 file is stale. Status distinguishes a managed process, an already-running unmanaged
-gateway, a stopped service, and a port occupied by another program. It never adopts
-or terminates an unmanaged process automatically.
+gateway, a supervised process, a stopped service, and a port occupied by another
+program. It reports the number of automatic restarts. It never adopts or terminates
+an unmanaged process automatically. `service stop` is intentional and remains
+stopped; `service start` and `service restart` clear a failed supervisor state and
+wait for verified local health.
 
 ## Private remote MCP through ngrok
 

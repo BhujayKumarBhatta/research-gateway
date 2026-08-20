@@ -43,7 +43,26 @@ uv run research-gateway serve
 
 Open `http://127.0.0.1:8765/ui`. The service also exposes local MCP at `http://127.0.0.1:8765/mcp`.
 
-For a background service, use:
+For a background service that returns after an unexpected crash, install automatic
+recovery once from the durable repository checkout:
+
+```bash
+cd /home/bhujay/ai-workspace/research-gateway
+uv run research-gateway service install --tunnel \
+  --config /mnt/c/Users/Bhujay_ROG/.research-gateway/config.toml
+```
+
+This creates a user service managed by WSL's service manager (systemd). It runs the
+project's durable virtual environment, checks the external config before each start,
+retries unexpected failures after five seconds, and enables the unit for later login
+sessions. If the service must start before an interactive login, an administrator can
+enable user lingering once:
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
+After the one-time installation, use:
 
 ```bash
 uv run research-gateway service start
@@ -52,13 +71,16 @@ uv run research-gateway service restart
 uv run research-gateway service stop
 ```
 
-Use `service start --tunnel` or `service restart --tunnel` for authenticated public
-MCP. The status command prints only safe locations and URLs. It never prints OAuth
+The installed tunnel choice remains unchanged when the flag is omitted. Use
+`service start --tunnel`, `service restart --tunnel`, or the matching `--no-tunnel`
+flag to change it. The status command prints only safe locations and URLs. It never prints OAuth
 tokens, the authorization password, a bearer token, or provider keys. A repeated
 start reports the existing healthy gateway and does not create another process.
 Status says whether that process is managed by the current runtime-state file,
-unmanaged, stopped, or whether another program occupies the configured port. Stop
-and restart never adopt or kill an unmanaged process automatically.
+supervised with automatic recovery, unmanaged, stopped, or whether another program
+occupies the configured port. Stop and restart never adopt or kill an unmanaged
+process automatically. `service uninstall` stops and removes only an owned unit; it
+does not delete the database, backups, logs, or external config.
 
 ## Logs and Excel backups
 
@@ -77,6 +99,12 @@ Follow the active log in WSL with:
 
 ```bash
 tail -f /mnt/d/AI/research-gateway/logs/research-gateway.log
+```
+
+Startup checks, process output, and automatic retry messages go to a second file:
+
+```bash
+tail -f /mnt/d/AI/research-gateway/logs/research-gateway-supervisor.log
 ```
 
 Press `Ctrl+C` to stop only `tail`; the gateway keeps running. HTTP access entries
