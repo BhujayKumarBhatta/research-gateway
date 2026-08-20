@@ -26,6 +26,7 @@ from research_gateway.operations.backups import ExcelBackupService
 from research_gateway.operations.logging import configure_logging
 from research_gateway.operations.service import ServiceManager, ServiceStartError
 from research_gateway.operations.storage import relocate_storage
+from research_gateway.operations.supervisor import SupervisorError, SystemdUserSupervisor
 from research_gateway.runtime import GatewayRuntime
 from research_gateway.tunnel import NgrokTunnel
 
@@ -35,7 +36,7 @@ app = typer.Typer(
     no_args_is_help=True,
 )
 acceptance_app = typer.Typer(help="Run deterministic and live release gates.")
-service_app = typer.Typer(help="Start, stop, restart, and inspect the detached local service.")
+service_app = typer.Typer(help="Install, operate, and inspect the local background service.")
 app.add_typer(acceptance_app, name="acceptance")
 app.add_typer(service_app, name="service")
 
@@ -257,13 +258,19 @@ def relocate_storage_command(
 @service_app.command("start")
 def service_start(
     config: Annotated[Path | None, typer.Option("--config")] = None,
-    tunnel: Annotated[bool, typer.Option("--tunnel/--no-tunnel")] = False,
+    tunnel: Annotated[bool | None, typer.Option("--tunnel/--no-tunnel")] = None,
 ) -> None:
-    """Start Research Gateway in the background and wait for local health."""
+    """Start Research Gateway and use automatic recovery when it is installed."""
     selected = (config or resolve_config_path()).expanduser().absolute()
+    settings = _load(selected)
+    manager = ServiceManager(settings, selected)
+    supervisor = SystemdUserSupervisor(settings, selected)
     try:
-        result = ServiceManager(_load(selected), selected).start(tunnel=tunnel)
-    except ServiceStartError as exc:
+        if supervisor.manages_config:
+            result = _start_with_supervisor(supervisor, manager, tunnel=tunnel)
+        else:
+            result = manager.start(tunnel=bool(tunnel))
+    except (ServiceStartError, SupervisorError) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(2) from None
     if result.get("running") and not result.get("started"):
@@ -277,22 +284,39 @@ def service_start(
 def service_stop(
     config: Annotated[Path | None, typer.Option("--config")] = None,
 ) -> None:
-    """Stop the validated Research Gateway process and its owned tunnel."""
+    """Stop the supervised service or a validated detached process."""
     selected = (config or resolve_config_path()).expanduser().absolute()
-    result = ServiceManager(_load(selected), selected).stop()
+    settings = _load(selected)
+    manager = ServiceManager(settings, selected)
+    supervisor = SystemdUserSupervisor(settings, selected)
+    try:
+        result = supervisor.stop(manager) if supervisor.manages_config else manager.stop()
+    except SupervisorError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(2) from None
     typer.echo("Service: stopped" if result.get("stopped") else "Service: already stopped")
 
 
 @service_app.command("restart")
 def service_restart(
     config: Annotated[Path | None, typer.Option("--config")] = None,
-    tunnel: Annotated[bool, typer.Option("--tunnel/--no-tunnel")] = False,
+    tunnel: Annotated[bool | None, typer.Option("--tunnel/--no-tunnel")] = None,
 ) -> None:
-    """Stop and start the background service with the selected tunnel mode."""
+    """Restart Research Gateway and repair a failed supervised process."""
     selected = (config or resolve_config_path()).expanduser().absolute()
+    settings = _load(selected)
+    manager = ServiceManager(settings, selected)
+    supervisor = SystemdUserSupervisor(settings, selected)
     try:
-        result = ServiceManager(_load(selected), selected).restart(tunnel=tunnel)
-    except ServiceStartError as exc:
+        if supervisor.manages_config:
+            current = supervisor.status(manager)
+            _reject_unowned_port(current)
+            if tunnel is not None:
+                supervisor.configure_tunnel(tunnel)
+            result = supervisor.restart(manager)
+        else:
+            result = manager.restart(tunnel=bool(tunnel))
+    except (ServiceStartError, SupervisorError) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(2) from None
     _print_service_status(result)
@@ -304,7 +328,78 @@ def service_status(
 ) -> None:
     """Show safe process, local URL, public URL, database, and log state."""
     selected = (config or resolve_config_path()).expanduser().absolute()
-    _print_service_status(ServiceManager(_load(selected), selected).status())
+    settings = _load(selected)
+    manager = ServiceManager(settings, selected)
+    supervisor = SystemdUserSupervisor(settings, selected)
+    result = supervisor.status(manager) if supervisor.manages_config else manager.status()
+    _print_service_status(result)
+
+
+@service_app.command("install")
+def service_install(
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+    tunnel: Annotated[bool, typer.Option("--tunnel/--no-tunnel")] = True,
+    working_directory: Annotated[
+        Path | None,
+        typer.Option(
+            "--working-directory",
+            help="Durable Research Gateway repository checkout used by systemd.",
+        ),
+    ] = None,
+    python_executable: Annotated[
+        Path | None,
+        typer.Option(
+            "--python-executable",
+            help="Python executable from the durable repository virtual environment.",
+        ),
+    ] = None,
+) -> None:
+    """Install automatic crash recovery, enable it at login, and start it."""
+    selected = (config or resolve_config_path()).expanduser().absolute()
+    settings = _load(selected)
+    manager = ServiceManager(settings, selected)
+    supervisor = SystemdUserSupervisor(
+        settings,
+        selected,
+        working_directory=working_directory,
+        python_executable=python_executable,
+    )
+    try:
+        supervisor.validate_durable_location()
+        if supervisor.installed and not supervisor.owned:
+            raise SupervisorError(
+                f"Existing unit is not managed by Research Gateway: {supervisor.unit_path}"
+            )
+        current = supervisor.status(manager) if supervisor.manages_config else manager.status()
+        already_supervised = current.get("classification") == "supervised"
+        if not already_supervised:
+            if current.get("classification") == "managed":
+                manager.stop()
+            elif current.get("running") or current.get("classification") == "port_conflict":
+                _reject_unowned_port(current)
+        supervisor.install(tunnel=tunnel)
+        result = supervisor.restart(manager) if already_supervised else supervisor.start(manager)
+    except (ServiceStartError, SupervisorError) as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(2) from None
+    typer.echo("Supervision installed and service started.")
+    _print_service_status(result)
+
+
+@service_app.command("uninstall")
+def service_uninstall(
+    config: Annotated[Path | None, typer.Option("--config")] = None,
+) -> None:
+    """Stop and remove Research Gateway automatic recovery without deleting data."""
+    selected = (config or resolve_config_path()).expanduser().absolute()
+    settings = _load(selected)
+    supervisor = SystemdUserSupervisor(settings, selected)
+    try:
+        result = supervisor.uninstall()
+    except SupervisorError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(2) from None
+    typer.echo("Supervision removed." if result.get("removed") else "Supervision not installed.")
 
 
 @app.command("acl-refresh")
@@ -527,10 +622,43 @@ def _load(config: Path | None):
         raise typer.Exit(2) from exc
 
 
+def _start_with_supervisor(
+    supervisor: SystemdUserSupervisor,
+    manager: ServiceManager,
+    *,
+    tunnel: bool | None,
+) -> dict[str, object]:
+    current = supervisor.status(manager)
+    _reject_unowned_port(current)
+    tunnel_changed = tunnel is not None and supervisor.configure_tunnel(tunnel)
+    if current.get("classification") == "supervised" and current.get("running"):
+        if tunnel_changed:
+            return supervisor.restart(manager)
+        return {**current, "started": False}
+    return supervisor.start(manager)
+
+
+def _reject_unowned_port(result: dict[str, object]) -> None:
+    classification = result.get("classification")
+    if classification == "port_conflict":
+        raise SupervisorError(
+            "The configured port is occupied by another service. "
+            "Research Gateway did not stop or replace it."
+        )
+    if result.get("running") and classification != "supervised":
+        raise SupervisorError(
+            "A Research Gateway process not owned by the supervisor is already running. "
+            "It was left intact; stop that process before enabling automatic recovery."
+        )
+
+
 def _print_service_status(result: dict[str, object]) -> None:
     classification = result.get("classification")
     labels = {
         "managed": "running (managed)",
+        "supervised": "running (supervised with automatic recovery)",
+        "supervisor_starting": "starting (supervisor is retrying)",
+        "supervisor_failed": "stopped (supervisor reports a failure)",
         "unmanaged": "running (existing/unmanaged instance)",
         "port_conflict": "stopped (configured port occupied by another service)",
         "stopped": "stopped",
@@ -541,12 +669,17 @@ def _print_service_status(result: dict[str, object]) -> None:
         typer.echo(f"PID: {result['pid']}")
     if result.get("observed_config_path"):
         typer.echo(f"Observed config: {result['observed_config_path']}")
+    if result.get("supervisor_installed"):
+        supervisor_state = "enabled" if result.get("supervisor_enabled") else "installed"
+        typer.echo(f"Supervisor: {supervisor_state}")
+        typer.echo(f"Automatic restarts: {result.get('supervisor_restarts', 0)}")
     for label, key in (
         ("Local UI", "local_ui_url"),
         ("Local MCP", "local_mcp_url"),
         ("Public MCP", "public_mcp_url"),
         ("Database", "database_path"),
         ("Log", "log_path"),
+        ("Supervisor log", "supervisor_log_path"),
     ):
         if result.get(key):
             typer.echo(f"{label}: {result[key]}")
